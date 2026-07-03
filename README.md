@@ -1,159 +1,212 @@
-# Turborepo starter
+# ER_GlacierNova Monorepo
 
-This Turborepo starter is maintained by the Turborepo core team.
+Turborepo monorepo with:
 
-## Using this example
+- `apps/frontend`: Next.js frontend app (package name: `web`)
+- `apps/backend_py`: FastAPI backend app (Python + `uv`)
+- `packages/ui`: shared UI components
+- `packages/eslint-config`: shared ESLint configs
+- `packages/typescript-config`: shared TypeScript configs
 
-Run the following command:
+## Prerequisites
+
+- Node.js `>=18`
+- `pnpm` (repo uses `pnpm@9`)
+- Python `>=3.11` (for backend)
+- [`uv`](https://docs.astral.sh/uv/) (for backend Python dependency management and running)
+
+## Quick Start (Full Repo)
+
+From the repository root:
 
 ```sh
-npx create-turbo@latest
+pnpm install
+pnpm dev
 ```
 
-## What's inside?
+This starts all `dev` tasks in Turborepo (frontend and backend).
 
-This Turborepo includes the following packages/apps:
+Expected local URLs:
+
+- Frontend: `http://localhost:3000`
+- Backend API: `http://localhost:8000`
+
+## What's Inside?
 
 ### Apps and Packages
 
-- `docs`: a [Next.js](https://nextjs.org/) app
-- `web`: another [Next.js](https://nextjs.org/) app
-- `@repo/ui`: a stub React component library shared by both `web` and `docs` applications
-- `@repo/eslint-config`: `eslint` configurations (includes `eslint-config-next` and `eslint-config-prettier`)
-- `@repo/typescript-config`: `tsconfig.json`s used throughout the monorepo
-
-Each package/app is 100% [TypeScript](https://www.typescriptlang.org/).
+- `apps/frontend` (`web`): [Next.js](https://nextjs.org/) app
+- `apps/backend_py` (`backend_py`): [FastAPI](https://fastapi.tiangolo.com/) backend service
+- `@repo/ui`: shared React component library
+- `@repo/eslint-config`: shared ESLint setup
+- `@repo/typescript-config`: shared TypeScript setup
 
 ### Utilities
 
-This Turborepo has some additional tools already setup for you:
-
 - [TypeScript](https://www.typescriptlang.org/) for static type checking
-- [ESLint](https://eslint.org/) for code linting
-- [Prettier](https://prettier.io) for code formatting
+- [ESLint](https://eslint.org/) for linting
+- [Prettier](https://prettier.io) for formatting
+- [Turborepo](https://turborepo.com/) for orchestration and caching
+
+## App Setup Guides
+
+### Frontend Setup (`apps/frontend`)
+
+Run from repo root:
+
+```sh
+pnpm install
+pnpm --filter=web dev
+```
+
+Or run from the frontend app folder:
+
+```sh
+cd apps/frontend
+pnpm dev
+```
+
+Frontend scripts:
+
+- `pnpm --filter=web dev`
+- `pnpm --filter=web build`
+- `pnpm --filter=web start`
+- `pnpm --filter=web lint`
+- `pnpm --filter=web check-types`
+
+### Backend Setup (`apps/backend_py`)
+
+The backend uses `uv` with dependencies defined in `apps/backend_py/pyproject.toml`.
+
+### 1) Create and use virtual environment
+
+From repo root:
+
+```sh
+cd apps/backend_py
+uv venv
+```
+
+Activate it (PowerShell):
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+### 2) Sync/install dependencies
+
+```sh
+uv sync
+```
+
+This installs everything from `pyproject.toml` and `uv.lock`.
+
+### 3) Add a new backend library
+
+Inside `apps/backend_py`:
+
+```sh
+uv add <package-name>
+uv sync
+```
+
+Example:
+
+```sh
+uv add httpx
+uv sync
+```
+
+### 4) Run backend server
+
+From repo root:
+
+```sh
+pnpm --filter=backend_py dev
+```
+
+Or from `apps/backend_py` directly:
+
+```sh
+pnpm dev
+```
+
+Backend serves on `http://localhost:8000`.
+
+Useful backend endpoints:
+
+- Health/root: `http://localhost:8000/`
+- Swagger UI: `http://localhost:8000/docs`
+- ReDoc: `http://localhost:8000/redoc`
+
+### Backend environment variables (`.env`)
+
+If you need environment variables for the API:
+
+1. Create `apps/backend_py/.env`
+2. Add keys, for example:
+
+```env
+APP_ENV=development
+API_KEY=replace-me
+```
+
+3. Load them in FastAPI code using your preferred approach (for example `pydantic-settings` + `python-dotenv` if you adopt those).
+
+## Turborepo Commands
 
 ### Build
 
-To build all apps and packages, run the following command:
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed (recommended):
+Build all apps and packages:
 
 ```sh
-cd my-turborepo
-turbo build
+pnpm build
 ```
 
-Without global `turbo`, use your package manager:
+Build a specific app/package:
 
 ```sh
-cd my-turborepo
-npx turbo build
-pnpm dlx turbo build
-pnpm exec turbo build
-```
-
-You can build a specific package by using a [filter](https://turborepo.dev/docs/crafting-your-repository/running-tasks#using-filters):
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed:
-
-```sh
-turbo build --filter=docs
-```
-
-Without global `turbo`:
-
-```sh
-npx turbo build --filter=docs
-pnpm exec turbo build --filter=docs
-pnpm exec turbo build --filter=docs
+pnpm exec turbo build --filter=web
+pnpm exec turbo build --filter=backend_py
 ```
 
 ### Develop
 
-To develop all apps and packages, run the following command:
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed (recommended):
+Develop all apps:
 
 ```sh
-cd my-turborepo
-turbo dev
+pnpm dev
 ```
 
-Without global `turbo`, use your package manager:
+Develop only one app:
 
 ```sh
-cd my-turborepo
-npx turbo dev
-pnpm exec turbo dev
-pnpm exec turbo dev
-```
-
-You can develop a specific package by using a [filter](https://turborepo.dev/docs/crafting-your-repository/running-tasks#using-filters):
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed:
-
-```sh
-turbo dev --filter=web
-```
-
-Without global `turbo`:
-
-```sh
-npx turbo dev --filter=web
 pnpm exec turbo dev --filter=web
-pnpm exec turbo dev --filter=web
+pnpm exec turbo dev --filter=backend_py
+```
+
+### Lint / Typecheck / Format
+
+```sh
+pnpm lint
+pnpm check-types
+pnpm format
 ```
 
 ### Remote Caching
 
-> [!TIP]
-> Vercel Remote Cache is free for all plans. Get started today at [vercel.com](https://vercel.com/signup?utm_source=remote-cache-sdk&utm_campaign=free_remote_cache).
-
-Turborepo can use a technique known as [Remote Caching](https://turborepo.dev/docs/core-concepts/remote-caching) to share cache artifacts across machines, enabling you to share build caches with your team and CI/CD pipelines.
-
-By default, Turborepo will cache locally. To enable Remote Caching you will need an account with Vercel. If you don't have an account you can [create one](https://vercel.com/signup?utm_source=turborepo-examples), then enter the following commands:
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed (recommended):
+Turborepo can use [Remote Caching](https://turborepo.dev/docs/core-concepts/remote-caching) (for example with Vercel).
 
 ```sh
-cd my-turborepo
-turbo login
-```
-
-Without global `turbo`, use your package manager:
-
-```sh
-cd my-turborepo
-npx turbo login
 pnpm exec turbo login
-pnpm exec turbo login
-```
-
-This will authenticate the Turborepo CLI with your [Vercel account](https://vercel.com/docs/concepts/personal-accounts/overview).
-
-Next, you can link your Turborepo to your Remote Cache by running the following command from the root of your Turborepo:
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed:
-
-```sh
-turbo link
-```
-
-Without global `turbo`:
-
-```sh
-npx turbo link
-pnpm exec turbo link
 pnpm exec turbo link
 ```
 
 ## Useful Links
 
-Learn more about the power of Turborepo:
-
-- [Tasks](https://turborepo.dev/docs/crafting-your-repository/running-tasks)
-- [Caching](https://turborepo.dev/docs/crafting-your-repository/caching)
-- [Remote Caching](https://turborepo.dev/docs/core-concepts/remote-caching)
-- [Filtering](https://turborepo.dev/docs/crafting-your-repository/running-tasks#using-filters)
-- [Configuration Options](https://turborepo.dev/docs/reference/configuration)
-- [CLI Usage](https://turborepo.dev/docs/reference/command-line-reference)
+- [Turborepo Tasks](https://turborepo.dev/docs/crafting-your-repository/running-tasks)
+- [Turborepo Caching](https://turborepo.dev/docs/crafting-your-repository/caching)
+- [Turborepo Remote Caching](https://turborepo.dev/docs/core-concepts/remote-caching)
+- [Turborepo Filtering](https://turborepo.dev/docs/crafting-your-repository/running-tasks#using-filters)
+- [FastAPI Docs](https://fastapi.tiangolo.com/)
+- [Next.js Docs](https://nextjs.org/docs)
