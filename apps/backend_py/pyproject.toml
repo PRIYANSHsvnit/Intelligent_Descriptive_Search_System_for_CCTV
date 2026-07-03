@@ -1,0 +1,27 @@
+[project]
+name = "backend_py"
+version = "0.1.0"
+description = "Computer Vision API"
+requires-python = ">=3.11"
+
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "opencv-python",
+    "numpy",
+    "pillow",
+    "python-multipart",
+    "ultralytics",
+    "torch",
+    "torchvision"
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.black]
+line-length = 100
+
+[tool.isort]
+profile = "black"
