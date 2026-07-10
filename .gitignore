@@ -41,4 +41,21 @@ yarn-error.log*
 __pycache__/
 *.pyc
 .pytest_cache/
-.mypy_cache/.direnv/
+.mypy_cache/
+.direnv/
+
+# --- NEVER COMMIT: footage, video, model weights, or ingest outputs (see CLAUDE.md) ---
+footage_data/
+*.avi
+*.mp4
+*.mkv
+*.webm
+*.pt
+*.onnx
+*.engine
+# ingest artifacts (crops, annotated clips, per-camera MP4s, tracklet dumps)
+apps/ingest/output/
+apps/ingest/output_reid/
+apps/ingest/media/
+**/crops/
+

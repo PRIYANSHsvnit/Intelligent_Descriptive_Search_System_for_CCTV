@@ -1,0 +1,32 @@
+[project]
+name = "cctv-ingest"
+version = "0.1.0"
+description = "Offline ingest pipeline for the Intelligent Descriptive Search System for CCTV (CityFlow vehicles)"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    # Heavy per-frame work runs on GPU (see gpu_setup.py NixOS shim)
+    "torch>=2.3",
+    "ultralytics>=8.3",              # YOLO11 + BoT-SORT
+    "transformers>=4.45",            # SigLIP2 (so400m, locked)
+    "opencv-python-headless>=4.10",  # regular opencv fails here (missing libxcb.so.1)
+    "numpy>=1.26",
+    "pillow>=10.0",
+    # Re-ID pass runs on CPU by design (plain onnxruntime, no CUDA deps)
+    "onnxruntime>=1.18",
+    "faiss-cpu>=1.8",                # offline cross-camera matcher (Phase 3)
+    # Storage
+    "psycopg[binary]>=3.2",
+    "pgvector>=0.3",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6",
+]
+
+[tool.uv]
+# Nix provides the interpreter and native libs (see flake.nix); never let uv fetch its own.
+python-downloads = "never"
+
+[tool.ruff]
+line-length = 100
