@@ -9,7 +9,9 @@ any of these later means re-embedding every vector, so DO NOT change them.
 # demo and so400m retrieves noticeably better; it fits the 6 GB RTX 4050 since it
 # is the only model resident during the SigLIP pass, and the +50% index size is
 # trivial at a few-thousand rows.
-SIGLIP_MODEL = "google/siglip2-so400m-patch16-224"
+# NOTE: so400m has no patch16-224 variant on HF; patch14-224 is the smallest so400m
+# at 224px input and is still 1152-dim, so the locked schema dim is unaffected.
+SIGLIP_MODEL = "google/siglip2-so400m-patch14-224"
 SEMANTIC_DIM = 1152
 
 # --- Re-ID appearance vector (VeRi-trained FastReID ResNet50-IBN), runs on CPU ---

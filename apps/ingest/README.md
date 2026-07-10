@@ -22,7 +22,7 @@ these forces re-embedding every vector.
 
 | Vector | Model | Dim |
 |---|---|---|
-| `semantic_vector` (search, GPU) | `google/siglip2-so400m-patch16-224` | **1152** |
+| `semantic_vector` (search, GPU) | `google/siglip2-so400m-patch14-224` | **1152** |
 | `reid_appearance` (tracing, CPU) | VeRi FastReID ResNet50-IBN (ONNX) | 2048 |
 | `reid_color` (tracing) | HSV signature | 56 |
 

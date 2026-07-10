@@ -7,6 +7,7 @@ dependencies = [
     # Heavy per-frame work runs on GPU (see gpu_setup.py NixOS shim)
     "torch>=2.3",
     "ultralytics>=8.3",              # YOLO11 + BoT-SORT
+    "lap>=0.5.12",                   # BoT-SORT association solver (else Ultralytics auto-installs)
     "transformers>=4.45",            # SigLIP2 (so400m, locked)
     "opencv-python-headless>=4.10",  # regular opencv fails here (missing libxcb.so.1)
     "numpy>=1.26",
@@ -14,6 +15,7 @@ dependencies = [
     # Re-ID pass runs on CPU by design (plain onnxruntime, no CUDA deps)
     "onnxruntime>=1.18",
     "faiss-cpu>=1.8",                # offline cross-camera matcher (Phase 3)
+    "motmetrics>=1.4",               # IDF1/IDP/IDR for evaluate_reid.py
     # Storage
     "psycopg[binary]>=3.2",
     "pgvector>=0.3",

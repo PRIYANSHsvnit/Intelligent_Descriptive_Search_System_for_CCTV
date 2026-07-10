@@ -51,6 +51,7 @@ footage_data/
 *.mkv
 *.webm
 *.pt
+*.pth
 *.onnx
 *.engine
 # ingest artifacts (crops, annotated clips, per-camera MP4s, tracklet dumps)

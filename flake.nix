@@ -27,6 +27,10 @@
           xorg.libXrender
           xorg.libSM
           xorg.libICE
+          # opencv-python-headless still NEEDs libxcb.so.1 (+ its libXau/libXdmcp deps)
+          xorg.libxcb
+          xorg.libXau
+          xorg.libXdmcp
         ];
       in
       {
