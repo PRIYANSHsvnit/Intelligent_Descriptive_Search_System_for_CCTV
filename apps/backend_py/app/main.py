@@ -68,3 +68,11 @@ def media(scene: str, camera: str):
 @app.get("/trace/{scene}/{global_id}")
 def trace(scene: str, global_id: int):
     return engine.trace(scene, global_id)
+
+
+@app.get("/scene-map/{scene}")
+def scene_map(scene: str):
+    path = config.scene_map_file(scene)
+    if not path.exists():
+        raise HTTPException(404, f"no map for {scene}")
+    return FileResponse(str(path), media_type="image/png")

@@ -192,5 +192,71 @@
   width: 100%;
   display: block;
   background: black;
-  max-height: 70vh;
+  max-height: 55vh;
+}
+
+.trace {
+  border-top: 1px solid #23262e;
+}
+.traceHead {
+  padding: 10px 16px 4px;
+  font-size: 13px;
+  color: #9aa0ac;
+}
+.traceBody {
+  display: grid;
+  grid-template-columns: minmax(260px, 1.2fr) 1fr;
+  gap: 14px;
+  padding: 8px 16px 16px;
+}
+@media (max-width: 720px) {
+  .traceBody {
+    grid-template-columns: 1fr;
+  }
+}
+.mapWrap {
+  position: relative;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid #23262e;
+  align-self: start;
+}
+.mapImg {
+  width: 100%;
+  display: block;
+}
+.mapSvg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+.timeline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-content: flex-start;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.hop {
+  width: 74px;
+}
+.hopCrop {
+  width: 74px;
+  height: 56px;
+  object-fit: cover;
+  border-radius: 6px;
+  background: #0e0f13;
+  display: block;
+}
+.hopMeta {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: #7a8090;
+  padding: 2px 1px 0;
+}
+.hopMeta strong {
+  color: #cdd2db;
 }

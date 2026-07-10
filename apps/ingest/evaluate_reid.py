@@ -174,16 +174,52 @@ def idf1_oracle(scene: str, cams: list[str]) -> dict:
     import motmetrics as mm
 
     acc = mm.MOTAccumulator(auto_id=False)
-    for cam in cams:
+    for ci, cam in enumerate(cams):
+        base = ci * 10_000_000  # unique numeric (cam,frame) timestamp block
         gt = load_gt(scene, cam)
         for frame in sorted(gt):
             ids = [g[0] for g in gt[frame]]
             boxes = [(g[1], g[2], g[3], g[4]) for g in gt[frame]]  # x,y,w,h
             dist = _iou_dist_matrix(boxes, boxes)
-            acc.update(ids, ids, dist, frameid=f"{cam}_{frame}")
+            acc.update(ids, ids, dist, frameid=base + frame)
     mh = mm.metrics.create()
     summary = mh.compute(acc, metrics=["idf1", "idp", "idr", "num_objects"], name="oracle")
     return {k: float(summary[k].iloc[0]) for k in ["idf1", "idp", "idr", "num_objects"]}
+
+
+def idf1_real(scene: str, cams: list[str], gid_map: dict[str, int]) -> dict:
+    """HEADLINE metric. Hypothesis = our predicted boxes labeled by predicted global_id,
+    restricted to GT-matched tracklets (Trap 2: exclude unlabeled). Reference = GT boxes
+    labeled by gt id. IDF1 over (cam,frame) timestamps via motmetrics."""
+    import motmetrics as mm
+
+    acc = mm.MOTAccumulator(auto_id=False)
+    for ci, cam in enumerate(cams):
+        base = ci * 10_000_000  # unique numeric (cam,frame) timestamp block
+        gt = load_gt(scene, cam)
+        by_frame, _ = load_pred(scene, cam)
+        tid2gt = inherit_gt_ids(scene, cam)  # track_id -> gt id (GT-matched only)
+        for frame in sorted(gt):
+            g = gt[frame]
+            gids = [x[0] for x in g]
+            gboxes = [(x[1], x[2], x[3], x[4]) for x in g]
+            hids, hboxes = [], []
+            for tid, x, y, wd, ht in by_frame.get(frame, []):
+                if tid not in tid2gt:               # unlabeled prediction -> excluded
+                    continue
+                gid = gid_map.get(f"{scene}_{cam}_t{tid}")
+                if gid is None:
+                    continue
+                hids.append(gid)
+                hboxes.append((x, y, wd, ht))
+            dist = _iou_dist_matrix(gboxes, hboxes)
+            acc.update(gids, hids, dist, frameid=base + frame)
+
+    mh = mm.metrics.create()
+    s = mh.compute(acc, metrics=["idf1", "idp", "idr", "num_objects", "num_predictions"], name="real")
+    return {k: round(float(s[k].iloc[0]), 4) for k in ["idf1", "idp", "idr"]} | {
+        "num_objects": int(s["num_objects"].iloc[0]),
+    }
 
 
 def main() -> int:
@@ -202,6 +238,14 @@ def main() -> int:
     if not args.oracle_only:
         print("\n[rank-1/5 cross-camera] (tuning diagnostic only)")
         print("  ", rank_cmc(args.scene, cams, w=args.fusion_w))
+
+        gid_path = paths.OUTPUT_ROOT / args.scene / "global_ids.json"
+        if gid_path.exists():
+            gid_map = {k: int(v) for k, v in json.loads(gid_path.read_text()).items()}
+            print("\n[IDF1 HEADLINE] (real grouping vs gt.txt)")
+            print("  ", idf1_real(args.scene, cams, gid_map))
+        else:
+            print("\n[IDF1 HEADLINE] no global_ids.json yet — run the Phase-3 matcher first.")
     return 0
 
 

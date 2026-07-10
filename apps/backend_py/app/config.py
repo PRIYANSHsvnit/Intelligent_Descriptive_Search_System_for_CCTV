@@ -15,5 +15,13 @@ OUTPUT_ROOT = Path(os.environ.get("INGEST_OUTPUT_ROOT", REPO_ROOT / "apps" / "in
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://cctv:cctv@localhost:5432/cctv")
 
+# Scene location maps (cam_loc/*.png). S03/S04/S05 share one map (S0345.png).
+CAM_LOC_DIR = REPO_ROOT / "footage_data" / "cam_loc"
+
+
+def scene_map_file(scene: str) -> Path:
+    name = "S0345" if scene in ("S03", "S04", "S05") else scene
+    return CAM_LOC_DIR / f"{name}.png"
+
 # SigLIP text encoder device: CPU is plenty for one short query per search.
 DEVICE = os.environ.get("SEARCH_DEVICE", "cpu")
