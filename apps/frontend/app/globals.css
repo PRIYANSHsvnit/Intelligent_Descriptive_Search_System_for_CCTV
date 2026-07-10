@@ -17,8 +17,8 @@ body {
 }
 
 body {
-  color: var(--foreground);
-  background: var(--background);
+  color: #e9e9ee;
+  background: #0b0c0f; /* dark dashboard, regardless of system theme */
 }
 
 * {

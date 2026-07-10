@@ -1,27 +1,25 @@
 [project]
 name = "backend_py"
 version = "0.1.0"
-description = "Computer Vision API"
-requires-python = ">=3.11"
+description = "CCTV descriptive-search API (Phase 2): SigLIP text search + media serving"
+requires-python = ">=3.11,<3.12"
 
 dependencies = [
-    "fastapi",
-    "uvicorn[standard]",
-    "opencv-python",
-    "numpy",
-    "pillow",
-    "python-multipart",
-    "ultralytics",
-    "torch",
-    "torchvision"
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    # SigLIP text encoder (runs on CPU — one short query per search)
+    "torch>=2.3",
+    "transformers>=4.45",
+    "numpy>=1.26",
+    "pillow>=10.0",
+    # DB
+    "psycopg[binary]>=3.2",
+    "pgvector>=0.3",
 ]
+
+[tool.uv]
+python-downloads = "never"
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-
-[tool.black]
-line-length = 100
-
-[tool.isort]
-profile = "black"
