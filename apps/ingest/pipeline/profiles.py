@@ -99,7 +99,11 @@ PROFILES: dict[str, Profile] = {
     # class ids are confirmed. Kept here so the seam exists and CityFlow stays the default.
     "india": Profile(
         name="india",
-        yolo_model="models/vehiclenet_y26m.pt",   # UVH-26 VehicleNet (YOLOv11); download first
+        # UVH-26 released only YOLOv11 -S and -X (no n/m/l). Ingest is an OFFLINE batch pass
+        # so latency barely matters -> default to -X for accuracy on hard classes (two-
+        # wheelers / rickshaws). Swap to -S if X is too heavy on the 6 GB card. Download to
+        # models/ first (Ultralytics-loadable; note underlying YOLO license is AGPL-3.0).
+        yolo_model="models/UVH-26-MV-YOLOv11-X.pt",
         yolo_imgsz=_CF_YOLO_IMGSZ,
         yolo_conf=_CF_YOLO_CONF,
         yolo_classes=None,                          # keep all 14 India classes
