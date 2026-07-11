@@ -20,9 +20,18 @@ from gpu_setup import ensure_gpu_libs
 
 ensure_gpu_libs()
 
-from pipeline import attributes, detect_track, embed_reid, embed_siglip, media, paths, store  # noqa: E402
+from pipeline import (  # noqa: E402
+    attributes,
+    color_siglip,
+    detect_track,
+    embed_reid,
+    embed_siglip,
+    media,
+    paths,
+    store,
+)
 
-ALL_STAGES = ["detect", "attributes", "media", "siglip", "reid", "store"]
+ALL_STAGES = ["detect", "attributes", "media", "siglip", "color", "reid", "store"]
 
 
 def main() -> int:
@@ -50,6 +59,8 @@ def main() -> int:
         each("media", lambda c: media.run(args.scene, c))
     if "siglip" in args.stages:
         each("siglip", lambda c: embed_siglip.run(args.scene, c))
+    if "color" in args.stages:
+        each("color", lambda c: color_siglip.run(args.scene, c))
     if "reid" in args.stages:
         each("reid", lambda c: embed_reid.run(args.scene, c))
     if "store" in args.stages:

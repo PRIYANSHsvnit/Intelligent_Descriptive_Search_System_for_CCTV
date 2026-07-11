@@ -35,6 +35,10 @@ __all__ = [
     "K_CROPS",
     "COLOR_HS_BINS",
     "COLOR_V_BINS",
+    "COLOR_VOCAB",
+    "COLOR_PROMPT_TEMPLATES",
+    "COLOR_PROMPT_NOUNS",
+    "COLOR_MIN_MARGIN",
     "REID_INPUT_HW",
     "REID_MEAN",
     "REID_STD",
@@ -48,6 +52,25 @@ K_CROPS = 3
 # --- HSV color signature (56-dim): 12x4 Hue x Sat (48) + 8 Value (8) ---------
 COLOR_HS_BINS = (12, 4)
 COLOR_V_BINS = 8
+
+# --- SigLIP zero-shot color name (pipeline/color_siglip.py) -------------------
+# Replaces the brittle HSV `dominant_color_name` for the display-only `color`
+# column. Pragmatic vehicle palette (color is never a hard filter, so we favor
+# common, visually-distinct names over exhaustive coverage).
+COLOR_VOCAB = (
+    "white", "black", "gray", "silver",
+    "red", "blue", "green", "yellow", "orange", "brown",
+)
+# Prompt ensemble: every (template x noun) is embedded, then averaged per color.
+COLOR_PROMPT_TEMPLATES = (
+    "a photo of a {color} {noun}",
+    "a {color} {noun}",
+    "a {color}-colored {noun}",
+)
+COLOR_PROMPT_NOUNS = ("car", "vehicle", "truck")
+# Min cosine margin between the top-2 colors to commit a label; below it the
+# tracklet is left uncolored (None) rather than mislabeled. 0.0 = always label.
+COLOR_MIN_MARGIN = 0.0
 
 # --- VeRi FastReID preprocessing --------------------------------------------
 # The exported ONNX BAKES IN normalization (pixel_mean/std are traced into the graph),
