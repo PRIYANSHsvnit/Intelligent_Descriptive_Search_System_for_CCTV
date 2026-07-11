@@ -17,15 +17,19 @@ import json
 import cv2
 import numpy as np
 
-from . import paths
+from . import paths, profiles
 from .cfg import REID_APPEARANCE_DIM, REID_INPUT_HW
 
-MODEL_PATH = paths.INGEST_ROOT / "models" / "veri_reid.onnx"
 _BATCH = 64
 
 
+def model_path():
+    """Encoder ONNX for the active profile (must output the locked 2048-d)."""
+    return paths.INGEST_ROOT / "models" / profiles.active().reid_onnx
+
+
 def available() -> bool:
-    return MODEL_PATH.exists()
+    return model_path().exists()
 
 
 def _preprocess(crop_bgr: np.ndarray) -> np.ndarray:
@@ -41,12 +45,13 @@ def run(scene: str, cam: str) -> dict:
     tracklets = json.loads((out / "tracklets.json").read_text())
     n = len(tracklets)
 
-    if not available():
-        return {"cam": cam, "skipped": "models/veri_reid.onnx missing", "tracklets": n}
+    mp = model_path()
+    if not mp.exists():
+        return {"cam": cam, "skipped": f"{mp.name} missing", "tracklets": n}
 
     import onnxruntime as ort
 
-    sess = ort.InferenceSession(str(MODEL_PATH), providers=["CPUExecutionProvider"])
+    sess = ort.InferenceSession(str(mp), providers=["CPUExecutionProvider"])
     in_name = sess.get_inputs()[0].name
     out_name = sess.get_outputs()[0].name
 

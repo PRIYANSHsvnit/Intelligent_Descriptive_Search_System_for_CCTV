@@ -28,7 +28,7 @@ from collections import Counter, defaultdict
 
 import numpy as np
 
-from pipeline import paths
+from pipeline import paths, profiles
 
 # motmetrics 1.4 predates NumPy 2.0 and calls np.asfarray (removed in 2.0). Shim it.
 if not hasattr(np, "asfarray"):
@@ -228,7 +228,9 @@ def main() -> int:
     ap.add_argument("--cams", nargs="*", default=None)
     ap.add_argument("--fusion-w", type=float, default=1.0)
     ap.add_argument("--oracle-only", action="store_true")
+    ap.add_argument("--profile", default="cityflow", choices=list(profiles.PROFILES))
     args = ap.parse_args()
+    profiles.use(args.profile)
     cams = args.cams or paths.list_cams(args.scene)
 
     print(f"scene={args.scene} cams={cams}")

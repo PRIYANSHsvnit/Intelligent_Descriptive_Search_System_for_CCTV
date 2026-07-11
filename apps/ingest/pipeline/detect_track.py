@@ -17,15 +17,8 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-from . import paths
-from .cfg import (
-    K_CROPS,
-    YOLO_CLASSES,
-    YOLO_CONF,
-    YOLO_IMGSZ,
-    YOLO_MODEL,
-    coco_subtype,
-)
+from . import paths, profiles
+from .cfg import K_CROPS
 
 
 def _laplacian_var(crop_bgr: np.ndarray) -> float:
@@ -80,15 +73,16 @@ def run(scene: str, cam: str, max_frames: int | None = None, device: int = 0) ->
         fps = paths.DEFAULT_FPS
     offset = paths.load_cam_offsets(scene)[cam]
 
-    model = YOLO(YOLO_MODEL)
+    prof = profiles.active()
+    model = YOLO(prof.yolo_model)
     results = model.track(
         source=str(video),
         stream=True,
         persist=True,
-        tracker="botsort.yaml",
-        imgsz=YOLO_IMGSZ,
-        conf=YOLO_CONF,
-        classes=YOLO_CLASSES,
+        tracker=prof.tracker,
+        imgsz=prof.yolo_imgsz,
+        conf=prof.yolo_conf,
+        classes=list(prof.yolo_classes) if prof.yolo_classes else None,
         half=True,
         device=device,
         vid_stride=1,          # FULL fps — never subsample before tracking
@@ -132,7 +126,7 @@ def run(scene: str, cam: str, max_frames: int | None = None, device: int = 0) ->
     tracklets = []
     for tid, acc in sorted(tracks.items()):
         num = len(acc.frames)
-        subtype, entity_type = coco_subtype(acc.clses)
+        subtype, entity_type = profiles.subtype_vote(acc.clses)
         f_start, f_end = min(acc.frames), max(acc.frames)
         ts_start = offset + f_start / fps
         ts_end = offset + f_end / fps

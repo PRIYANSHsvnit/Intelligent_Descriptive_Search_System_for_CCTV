@@ -30,9 +30,12 @@ import cv2
 import numpy as np
 
 from pipeline import paths
-from pipeline.embed_reid import MODEL_PATH, _preprocess
+from pipeline.embed_reid import _preprocess
 from pipeline.cfg import REID_APPEARANCE_DIM
 
+# This probe specifically tests the VeRi checkpoint, so it pins veri_reid.onnx directly
+# (independent of the active domain profile).
+MODEL_PATH = paths.INGEST_ROOT / "models" / "veri_reid.onnx"
 VERI_ROOT = paths.REPO_ROOT / "VeRi"
 _BATCH = 64
 

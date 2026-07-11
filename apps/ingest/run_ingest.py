@@ -28,6 +28,7 @@ from pipeline import (  # noqa: E402
     embed_siglip,
     media,
     paths,
+    profiles,
     store,
 )
 
@@ -40,10 +41,14 @@ def main() -> int:
     ap.add_argument("--cams", nargs="*", default=None, help="default: all cams in the scene")
     ap.add_argument("--max-frames", type=int, default=None)
     ap.add_argument("--stages", nargs="*", default=ALL_STAGES, choices=ALL_STAGES)
+    ap.add_argument("--profile", default="cityflow", choices=list(profiles.PROFILES),
+                    help="domain profile: detector + class map + re-ID encoder + footage dir")
     args = ap.parse_args()
 
+    prof = profiles.use(args.profile)
     cams = args.cams or paths.list_cams(args.scene)
-    print(f"scene={args.scene} cams={cams} stages={args.stages} max_frames={args.max_frames}")
+    print(f"profile={prof.name} scene={args.scene} cams={cams} "
+          f"stages={args.stages} max_frames={args.max_frames}")
 
     def each(stage_name, fn):
         print(f"\n=== {stage_name} ===")

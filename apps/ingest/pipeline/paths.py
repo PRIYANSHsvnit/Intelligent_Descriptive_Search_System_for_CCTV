@@ -20,9 +20,15 @@ from pathlib import Path
 INGEST_ROOT = Path(__file__).resolve().parent.parent
 # repo root
 REPO_ROOT = INGEST_ROOT.parent.parent
-FOOTAGE_ROOT = REPO_ROOT / "footage_data" / "train"
+FOOTAGE_DATA = REPO_ROOT / "footage_data"
 CAM_TIMESTAMP_DIR = REPO_ROOT / "footage_data" / "cam_timestamp"
 OUTPUT_ROOT = INGEST_ROOT / "output"
+
+
+def footage_root() -> Path:
+    """Scene root for the active domain profile (footage_data/<profile.footage_dir>)."""
+    from . import profiles
+    return FOOTAGE_DATA / profiles.active().footage_dir
 
 # Synthetic display clock only (CityFlow has no real wall time); ts_*_s is the real filter.
 SCENE_BASE_WALL = _dt.datetime(2024, 1, 1, 0, 0, 0, tzinfo=_dt.timezone.utc)
@@ -31,15 +37,15 @@ DEFAULT_FPS = 10.0
 
 
 def scene_dir(scene: str) -> Path:
-    return FOOTAGE_ROOT / scene
+    return footage_root() / scene
 
 
 def cam_video(scene: str, cam: str) -> Path:
-    return FOOTAGE_ROOT / scene / cam / "vdo.avi"
+    return footage_root() / scene / cam / "vdo.avi"
 
 
 def cam_gt(scene: str, cam: str) -> Path:
-    return FOOTAGE_ROOT / scene / cam / "gt" / "gt.txt"
+    return footage_root() / scene / cam / "gt" / "gt.txt"
 
 
 def cam_out(scene: str, cam: str) -> Path:

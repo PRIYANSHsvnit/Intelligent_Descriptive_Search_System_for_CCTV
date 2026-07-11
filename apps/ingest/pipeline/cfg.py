@@ -12,26 +12,22 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from constants import (  # noqa: E402  (re-export locked Phase-0 constants)
+from constants import (  # noqa: E402  (re-export locked Phase-0 dims/model)
     REID_APPEARANCE_DIM,
     REID_COLOR_DIM,
     SEMANTIC_DIM,
     SIGLIP_MODEL,
-    YOLO_CLASSES,
-    YOLO_CONF,
-    YOLO_IMGSZ,
-    YOLO_MODEL,
 )
+
+# NOTE: the detector knobs (YOLO_MODEL/IMGSZ/CONF/CLASSES) and the class→subtype vote
+# moved to pipeline/profiles.py — they are per-domain, not global. constants.py keeps the
+# CityFlow values, which the "cityflow" profile reads.
 
 __all__ = [
     "REID_APPEARANCE_DIM",
     "REID_COLOR_DIM",
     "SEMANTIC_DIM",
     "SIGLIP_MODEL",
-    "YOLO_CLASSES",
-    "YOLO_CONF",
-    "YOLO_IMGSZ",
-    "YOLO_MODEL",
     "K_CROPS",
     "COLOR_HS_BINS",
     "COLOR_V_BINS",
@@ -42,7 +38,6 @@ __all__ = [
     "REID_INPUT_HW",
     "REID_MEAN",
     "REID_STD",
-    "coco_subtype",
     "dominant_color_name",
 ]
 
@@ -80,20 +75,6 @@ COLOR_MIN_MARGIN = 0.0
 REID_INPUT_HW = (256, 256)              # (H, W)
 REID_MEAN = (123.675, 116.28, 103.53)   # 0-255 scale, RGB
 REID_STD = (58.395, 57.12, 57.375)
-
-# COCO id → our subtype. entity_type = 'person' iff class 0 else 'vehicle'.
-_COCO = {0: "person", 1: "bicycle", 2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
-
-
-def coco_subtype(cls_ids) -> tuple[str, str]:
-    """Majority-vote a track's class ids → (subtype, entity_type)."""
-    from collections import Counter
-
-    top = Counter(int(c) for c in cls_ids).most_common(1)[0][0]
-    subtype = _COCO.get(top, "car")
-    entity_type = "person" if top == 0 else "vehicle"
-    return subtype, entity_type
-
 
 # Coarse human color names from a dominant HSV bin (for the `color` column /
 # soft signal only — never a hard filter). H in [0,180] (OpenCV), S,V in [0,255].
