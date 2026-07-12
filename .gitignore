@@ -61,3 +61,6 @@ apps/ingest/media/
 **/crops/
 
 VeRi/
+
+# Downloaded detector weights (repo-root); large, fetched per-machine (see profiles.py india)
+/models/

@@ -26,6 +26,8 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
+_REPO_ROOT = Path(__file__).resolve().parents[3]  # apps/ingest/pipeline/profiles.py -> repo root
+
 # constants.py (Phase-0 locked dims + the CityFlow detector defaults) is the parent dir.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from constants import (  # noqa: E402
@@ -61,9 +63,9 @@ _CITYFLOW_CLASS_MAP: dict[int, tuple[str, str]] = {
     7: ("truck", "vehicle"),
 }
 
-# India: UVH-26 / VehicleNet 14-class taxonomy (all 'vehicle' entities). The ids below are
-# the published class order; CONFIRM against the downloaded model's names before the first
-# India run, and swap reid_onnx once an India-tuned encoder exists (still 2048-d).
+# India: UVH-26 / VehicleNet-Y26x 14-class taxonomy (all 'vehicle' entities). Ids below are
+# VERIFIED against the checkpoint's model.names (best.pt). Swap reid_onnx once an India-tuned
+# encoder exists (still 2048-d).
 _INDIA_CLASS_MAP: dict[int, tuple[str, str]] = {
     0: ("hatchback", "vehicle"),
     1: ("sedan", "vehicle"),
@@ -95,16 +97,18 @@ PROFILES: dict[str, Profile] = {
         reid_onnx="veri_reid.onnx",
         footage_dir="train",
     ),
-    # PLACEHOLDER — not runnable until the UVH-26 model is downloaded to models/ and the
-    # class ids are confirmed. Kept here so the seam exists and CityFlow stays the default.
+    # Needs India footage under footage_data/india/ and (eventually) an India-tuned reid_onnx;
+    # the detector below is the official IISc model, wired and verified to load.
     "india": Profile(
         name="india",
-        # UVH-26 released only YOLOv11 -S and -X (no n/m/l). Ingest is an OFFLINE batch pass
-        # so latency barely matters -> default to -X for accuracy on hard classes (two-
-        # wheelers / rickshaws). Swap to -S if X is too heavy on the 6 GB card. Download to
-        # models/ first (Ultralytics-loadable; note underlying YOLO license is AGPL-3.0).
-        yolo_model="models/UVH-26-MV-YOLOv11-X.pt",
-        yolo_imgsz=_CF_YOLO_IMGSZ,
+        # Official IISc AIM UVH-26-MV YOLOv11-X (arXiv 2511.02563, Apache-2.0 repo / AGPL-3.0
+        # underlying YOLO). Fine-tuned on the UVH-26 Bengaluru-CCTV dataset, 14 Indian classes.
+        # Absolute path — ingest runs from apps/ingest but weights live at repo-root models/.
+        # (A third-party YOLO26x fine-tune, Perception365/VehicleNet-Y26x, is also in models/;
+        # we use the official one for provenance/citability.)
+        yolo_model=str(_REPO_ROOT / "models" / "iisc-aim" / "UVH-26" / "weights"
+                       / "YOLOv11-X" / "UVH-26-MV-YOLOv11-X.pt"),
+        yolo_imgsz=640,                             # trained at 640; bump if small-object recall needs it
         yolo_conf=_CF_YOLO_CONF,
         yolo_classes=None,                          # keep all 14 India classes
         tracker="botsort.yaml",
