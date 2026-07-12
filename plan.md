@@ -76,7 +76,7 @@ Why two vectors: SigLIP is trained to match images to *captions*, so it nails "a
    ▼
 [5 ATTRIBUTES]  per tracklet:
               • type/subtype ← majority-vote of YOLO class over the track
-              • color        ← dominant color name from the HSV signature (§ Detail)
+              • color        ← name via SigLIP zero-shot; HSV 56-d kept as match feature (§ Detail)
               • time         ← frame → seconds → global scene clock (§ Detail)
               • plate_text   ← LATER (OCR, vehicles, bonus)
               • person_attrs ← LATER (outfit region colors, hat, bag…)
@@ -188,11 +188,34 @@ Same inputs as connected components, but a single bad link stays local instead o
 | Ingest CV | Python + `uv`, PyTorch (**GPU**), Ultralytics **YOLO11** + **BoT-SORT** | one library does detect+track; GPU-ready |
 | Semantic model | **SigLIP** (`transformers` or `open_clip`) | image+text in one space → search-by-description; works for cars **and** people from one model |
 | Re-ID model | **VeRi-trained vehicle re-ID** (FastReID weights via ONNX, run on **CPU**; see [6]); DINOv2 = ablation only | trained on "same car, different camera" — the accuracy engine for tracing |
-| Color | OpenCV **HSV histogram** signature | the structured color signal appearance models miss |
+| Color | OpenCV **HSV histogram** (56-d match feature) + **SigLIP zero-shot** name | HSV gives the structured match signal; SigLIP *names* the color (the HSV name was ~70% wrong on white/gray/silver) |
 | Plate (later) | **PaddleOCR / EasyOCR** | read plates; nullable bonus |
 | Store | **Postgres 16 + pgvector** (Docker → Supabase/Neon) | metadata + both vectors + filters in one SQL query; internet-accessible for the team |
 | Backend | **FastAPI** (`apps/backend_py`) | already scaffolded; add real endpoints |
 | Frontend | **Next.js 16** (`apps/frontend`) | already scaffolded; add search UI + map |
+
+---
+
+## Models at a glance
+
+The authoritative *what runs where* for the pipeline — exact IDs, device, and output dim. (The "Tech stack" table above gives the *why*; this one is the quick lookup. Stage numbers map to Path A.)
+
+| Stage | Model / engine | Exact ID / file | Device | Output (dim) |
+|---|---|---|---|---|
+| [2] detect | YOLO — **profile-swapped** | cityflow `yolo11m.pt` (imgsz 1280, conf 0.3, COCO ids 0/1/2/3/5/7) · india `UVH-26-MV-YOLOv11-X.pt` (imgsz 640, all 14) | GPU fp16 | boxes + class |
+| [3] track | **BoT-SORT** | `botsort.yaml` (bundled with Ultralytics) | GPU | track ids |
+| [5] color signature | HSV histogram (no ML) | 12×4 H×S + 8 V | CPU / OpenCV | `reid_color` (56) |
+| [6a] semantic | **SigLIP2** image encoder | `google/siglip2-so400m-patch14-224` | GPU fp16 | `semantic_vector` (1152) |
+| [6b] color name | **SigLIP2** text encoder (same model, zero-shot) | `google/siglip2-so400m-patch14-224` | GPU | `color` name (10-color vocab) |
+| [6c] appearance | **FastReID VeRi ResNet50-IBN (SBS)** — **profile-swappable** | `veri_sbs_R50-ibn.pth` → `veri_reid.onnx` (256×256 RGB) | **CPU** onnxruntime | `reid_appearance` (2048) |
+| search (Path B) | **SigLIP2** text encoder (same model) | `google/siglip2-so400m-patch14-224` | **CPU** | query vector (1152) |
+
+**Notes that matter (reasoning, not repetition):**
+- **SigLIP2 `so400m-patch14-224` is used in three places** — image embed (index), color naming, and query-time text embed. It's **locked** to 1152-d and must be byte-identical between ingest and the backend (`apps/backend_py/app/config.py` literally warns "Do not diverge"). Swapping it forces re-embedding every row.
+- **Color naming moved HSV → SigLIP zero-shot.** The HSV 56-d signature ([5]) stays as a *matching* feature (fused in the matcher, default weight 0); the color **name** users see is now SigLIP zero-shot (prompt-ensembled over 10 colors), which fixed the ~70% HSV mislabels on achromatic paint. This **supersedes** the "dominant HSV bin → name" note in Detail [5].
+- **Only two models are profile-swapped** (CityFlow ↔ India): the YOLO detector and the re-ID ONNX. SigLIP, color, BoT-SORT, matcher, DB, API, UI are all domain-agnostic and shared.
+- **Locked dims (never fork):** semantic 1152 / reid_appearance 2048 / reid_color 56.
+- **CPU vs GPU:** re-ID and the entire live search path run on **CPU by design** (plain onnxruntime dodges the NixOS CUDA-discovery pain); detect + SigLIP run on GPU.
 
 ---
 
@@ -245,7 +268,7 @@ CREATE TABLE tracklets (
   -- what it is
   entity_type     TEXT NOT NULL,              -- 'vehicle' | 'person'
   subtype         TEXT,                       -- 'car','truck','bus','motorcycle','bicycle','person'
-  color           TEXT,                       -- dominant color name (Phase 1); RANKING signal only, never a hard filter
+  color           TEXT,                       -- color name via SigLIP zero-shot (Phase 1); RANKING signal only, never a hard filter
   -- when (global scene clock; see Detail)
   frame_start     INT,  frame_end   INT,
   ts_start_s      REAL, ts_end_s    REAL,     -- seconds from scene start
@@ -295,7 +318,7 @@ Search query shape: `... WHERE entity_type='vehicle' [AND time range] ORDER BY s
 
 **[5] ATTRIBUTES.**
 - *Subtype/type*: majority vote of the class id over all the track's detections (robust to per-frame flips). `entity_type = person` if class 0 else `vehicle`.
-- *Color signature (56-dim)*: on the central region `crop[0.2h:0.8h, 0.2w:0.8w]` (skips road/background): convert to HSV; 2-D Hue×Saturation histogram, bins `[12, 4]` over ranges `[0,180]×[0,256]` (48 values) + 1-D Value histogram, `8` bins over `[0,256]` (so black/white/silver, where hue is meaningless, still separate). Concatenate → 56; normalize to sum 1; take element-wise `sqrt` (Hellinger, so histogram distance behaves under cosine); L2-normalize. Map the dominant HSV bin → a human color name for the `color` column and filters.
+- *Color signature (56-dim)*: on the central region `crop[0.2h:0.8h, 0.2w:0.8w]` (skips road/background): convert to HSV; 2-D Hue×Saturation histogram, bins `[12, 4]` over ranges `[0,180]×[0,256]` (48 values) + 1-D Value histogram, `8` bins over `[0,256]` (so black/white/silver, where hue is meaningless, still separate). Concatenate → 56; normalize to sum 1; take element-wise `sqrt` (Hellinger, so histogram distance behaves under cosine); L2-normalize. **This 56-d signature is kept as a *match* feature only.** *(Superseded for naming: the `color` **column** is no longer the dominant HSV bin — it's now **SigLIP zero-shot** over a 10-color vocab, which reuses the already-computed `semantic_vector` and fixed the ~70% HSV mislabels on white/gray/silver. See "Models at a glance".)*
 - *Time / global clock*: `ts = cam_time_offset + frame/fps`. Cross-camera tracing needs a *shared* clock; use CityFlow's per-camera `cam_timestamp` offsets (confirmed in the zip — e.g. S01: c001 0.0 → c005 2.24s). **S04's offsets reach ~176s**, so the offset-0 fallback is unsafe there — extract the real offsets, don't default. `ts_*_s` are **seconds from scene start** (this is what the UI time filter uses); `wall_*` is a **synthetic display clock only**, not real wall time.
 
 **[6] EMBED** (mean-pool over the K crops, then L2-normalize each vector):
@@ -373,10 +396,16 @@ Concretely, that shapes the design:
 - **Evaluation degrades gracefully.** On CityFlow we quote hard numbers vs `gt.txt`. On uncalibrated production footage there's no GT, so validation becomes qualitative/spot-check — plan for that, don't assume a metric.
 
 **Domain-shift issues to expect on Indian roads (flagged now, not solved yet):**
-1. **Vehicle mix.** CityFlow is cars/trucks/buses; Indian roads are dominated by **two-wheelers, auto-rickshaws, cycle-rickshaws, tractors**. YOLO's COCO classes have no "auto-rickshaw" (it'll mislabel as car/truck/motorcycle) — detection likely needs India-specific fine-tuning.
-2. **Re-ID domain gap.** A VeRi-trained encoder is strong on cars but weaker on autos and two-wheelers — the exact vehicles that dominate here. Future step: fine-tune the re-ID encoder on Indian vehicle imagery.
+1. **Vehicle mix.** CityFlow is cars/trucks/buses; Indian roads are dominated by **two-wheelers, auto-rickshaws, cycle-rickshaws, tractors**. YOLO's COCO classes have no "auto-rickshaw" (it'll mislabel as car/truck/motorcycle) — detection needs India-specific weights. **(→ now addressed — see *Current India-profile status* below.)**
+2. **Re-ID domain gap.** A VeRi-trained encoder is strong on cars but weaker on autos and two-wheelers — the exact vehicles that dominate here. Future step: fine-tune the re-ID encoder on Indian vehicle imagery. **(→ still open — see status below.)**
 3. **Conditions.** Denser occlusion, night/low-light, monsoon glare, more varied camera angles/quality — all degrade detection, color, and re-ID beyond what CityFlow's clean daytime footage implies.
 4. **Plates.** Indian plate formats/scripts need India-specific OCR (relevant to the later plate branch).
+
+**Current India-profile status (branch `pipeline-for-indian-roads`).** The pipeline is now profile-driven (`apps/ingest/pipeline/profiles.py`): one codebase, a `--profile {cityflow|india}` switch that flips **only** the detector, class map, re-ID encoder, and footage dir — everything else is the shared, domain-agnostic core above. Where each India knob stands:
+- **Detector — DONE.** Official **AIM@IISc UVH-26-MV YOLOv11-X** (arXiv 2511.02563; Apache-2.0 repo, AGPL-3.0 underlying YOLO), wired and verified to load via Ultralytics. 14 India-specific classes (hatchback/sedan/SUV/MUV/bus/truck/three-wheeler/two-wheeler/LCV/mini-bus/tempo-traveller/bicycle/van/others); class-id order confirmed against the checkpoint's `model.names`. imgsz 640 (its training resolution). Resolves domain-shift #1 — auto-rickshaws and two-wheelers now have real classes instead of COCO mislabels. *(A third-party YOLO26x fine-tune, `Perception365/VehicleNet-Y26x`, was evaluated and rejected in favour of the official model for provenance/citability.)*
+- **Re-ID — STILL A GAP (the weakest link for India).** The india profile uses the **same `veri_reid.onnx`** as a placeholder — VeRi/CityFlow-trained, so domain-shift #2 is unaddressed on autos/two-wheelers. No public Indian vehicle re-ID / MTMC dataset exists (CityFlow is the only MTMC benchmark), so closing this means sourcing Indian multi-camera footage and self-supervised / ANPR-labelled fine-tuning, then re-exporting a 2048-d ONNX (dim stays locked). Not started.
+- **Footage — MISSING.** No `footage_data/india/` clips yet, so `--profile india` can't run end-to-end. CityFlow stays the only footage with ground truth → it remains the regression bench and the only defensible IDF1 number.
+- **Color / SigLIP / matcher / DB / API / UI — unchanged**, domain-agnostic, work as-is under either profile.
 
 None of this blocks the hackathon — CityFlow is the right thing to build and demo on. It just means we keep the **portable core independent of CityFlow's conveniences**, and stay honest about what transfers to Indian roads and what needs more work.
 
