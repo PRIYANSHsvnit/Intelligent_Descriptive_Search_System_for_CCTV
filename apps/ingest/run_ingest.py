@@ -37,12 +37,13 @@ ALL_STAGES = ["detect", "attributes", "media", "siglip", "color", "reid", "store
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--scene", default="S01")
+    ap.add_argument("--scene", default="SUR01")
     ap.add_argument("--cams", nargs="*", default=None, help="default: all cams in the scene")
     ap.add_argument("--max-frames", type=int, default=None)
     ap.add_argument("--stages", nargs="*", default=ALL_STAGES, choices=ALL_STAGES)
-    ap.add_argument("--profile", default="cityflow", choices=list(profiles.PROFILES),
-                    help="domain profile: detector + class map + re-ID encoder + footage dir")
+    ap.add_argument("--profile", default="india", choices=list(profiles.PROFILES),
+                    help="domain profile (default india = real Surat footage; "
+                         "use --profile cityflow --scene S01 for the ground-truth regression bench)")
     args = ap.parse_args()
 
     prof = profiles.use(args.profile)

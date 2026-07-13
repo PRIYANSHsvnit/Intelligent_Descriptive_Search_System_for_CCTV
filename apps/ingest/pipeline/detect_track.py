@@ -59,6 +59,51 @@ class _TrackAcc:
         return [c for _, _, c in sorted(self.heap, key=lambda t: t[0], reverse=True)]
 
 
+# Sentinel class id for person dets in detections.npy — COCO 'person' is id 0, which
+# would collide with a vehicle class id 0 (india: hatchback) in the flat array.
+PERSON_CLS = 100
+
+
+def _iou(a, b) -> float:
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = (a[2] - a[0]) * (a[3] - a[1])
+    area_b = (b[2] - b[0]) * (b[3] - b[1])
+    return inter / (area_a + area_b - inter)
+
+
+def _explained_by_person(vbox, person_boxes, iou_thr=0.5, area_band=(0.4, 1.9)) -> bool:
+    """True if some person box has the same footprint as this vehicle box — i.e. the
+    'vehicle' is really a standing/walking pedestrian. A genuine rider's bike box is
+    ~2x+ the rider-person box area, so it stays above the band and is kept."""
+    va = max(1.0, (vbox[2] - vbox[0]) * (vbox[3] - vbox[1]))
+    for pb in person_boxes:
+        if _iou(vbox, pb) < iou_thr:
+            continue
+        pa = max(1.0, (pb[2] - pb[0]) * (pb[3] - pb[1]))
+        if area_band[0] <= va / pa <= area_band[1]:
+            return True
+    return False
+
+
+def _accumulate(tracks, detections, frame_idx, tid, box, conf, cls, img, W, H) -> None:
+    """Clamp a box to the frame, record the raw detection, and add its crop to the track."""
+    x1, y1, x2, y2 = box
+    xi1, yi1 = max(0, int(x1)), max(0, int(y1))
+    xi2, yi2 = min(W, int(x2)), min(H, int(y2))
+    if xi2 <= xi1 or yi2 <= yi1:
+        return
+    detections.append((frame_idx, tid, x1, y1, x2, y2, float(conf), cls))
+    acc = tracks.get(tid)
+    if acc is None:
+        acc = tracks[tid] = _TrackAcc(tid)
+    acc.add(frame_idx, float(conf), int(cls), img[yi1:yi2, xi1:xi2])
+
+
 def run(scene: str, cam: str, max_frames: int | None = None, device: int = 0) -> dict:
     video = paths.cam_video(scene, cam)
     out = paths.cam_out(scene, cam)
@@ -74,76 +119,87 @@ def run(scene: str, cam: str, max_frames: int | None = None, device: int = 0) ->
     offset = paths.load_cam_offsets(scene)[cam]
 
     prof = profiles.active()
-    model = YOLO(prof.yolo_model)
-    results = model.track(
-        source=str(video),
-        stream=True,
-        persist=True,
-        tracker=prof.tracker,
-        imgsz=prof.yolo_imgsz,
-        conf=prof.yolo_conf,
-        classes=list(prof.yolo_classes) if prof.yolo_classes else None,
-        half=True,
-        device=device,
-        vid_stride=1,          # FULL fps — never subsample before tracking
-        verbose=False,
-    )
+    common = dict(source=str(video), stream=True, persist=True, tracker=prof.tracker,
+                  half=True, device=device, vid_stride=1, verbose=False)  # FULL fps
 
-    tracks: dict[int, _TrackAcc] = {}
+    veh_model = YOLO(prof.yolo_model)
+    veh_stream = veh_model.track(
+        imgsz=prof.yolo_imgsz, conf=prof.yolo_conf,
+        classes=list(prof.yolo_classes) if prof.yolo_classes else None, **common)
+
+    # Optional 2nd detector for 'person' entities (india: UVH-26 has no person class).
+    # Both stream the same video at vid_stride=1, so zip() stays frame-aligned; each keeps
+    # its own tracker/id namespace ('t' for vehicles, 'p' for persons).
+    pdet = prof.person_detector
+    per_model = None
+    if pdet is not None:
+        per_model = YOLO(pdet.weights)
+        per_stream = per_model.track(imgsz=pdet.imgsz, conf=pdet.conf, classes=[pdet.class_id], **common)
+        paired = zip(veh_stream, per_stream)
+    else:
+        paired = ((r, None) for r in veh_stream)
+
+    veh_tracks: dict[int, _TrackAcc] = {}
+    person_tracks: dict[int, _TrackAcc] = {}
     detections: list[tuple] = []  # frame,tid,x1,y1,x2,y2,conf,cls
     frame_idx = 0  # 1-based to match MOTChallenge GT
 
-    for r in results:
+    for veh_r, per_r in paired:
         frame_idx += 1
         if max_frames is not None and frame_idx > max_frames:
             break
-        boxes = r.boxes
-        if boxes is None or boxes.id is None:
-            continue
-        img = r.orig_img
-        xyxy = boxes.xyxy.cpu().numpy()
-        ids = boxes.id.cpu().numpy().astype(int)
-        confs = boxes.conf.cpu().numpy()
-        clses = boxes.cls.cpu().numpy().astype(int)
+        img = veh_r.orig_img
         H, W = img.shape[:2]
-        for (x1, y1, x2, y2), tid, conf, cls in zip(xyxy, ids, confs, clses):
-            xi1, yi1 = max(0, int(x1)), max(0, int(y1))
-            xi2, yi2 = min(W, int(x2)), min(H, int(y2))
-            if xi2 <= xi1 or yi2 <= yi1:
-                continue
-            detections.append((frame_idx, tid, x1, y1, x2, y2, float(conf), cls))
-            crop = img[yi1:yi2, xi1:xi2]
-            acc = tracks.get(tid)
-            if acc is None:
-                acc = tracks[tid] = _TrackAcc(tid)
-            acc.add(frame_idx, float(conf), int(cls), crop)
+
+        # person pass: accumulate person tracks + collect boxes for FP suppression
+        person_boxes: list[tuple] = []
+        if per_r is not None and per_r.boxes is not None and per_r.boxes.id is not None:
+            pxyxy = per_r.boxes.xyxy.cpu().numpy()
+            pids = per_r.boxes.id.cpu().numpy().astype(int)
+            pconfs = per_r.boxes.conf.cpu().numpy()
+            for box, pid, conf in zip(pxyxy, pids, pconfs):
+                person_boxes.append(tuple(box))
+                _accumulate(person_tracks, detections, frame_idx, int(pid), box, conf, PERSON_CLS, img, W, H)
+
+        # vehicle pass: drop person-confusable boxes (2-wheeler/bicycle) that a same-sized
+        # person box explains — the principled version of pedestrian-FP suppression
+        vb = veh_r.boxes
+        if vb is not None and vb.id is not None:
+            vxyxy = vb.xyxy.cpu().numpy()
+            vids = vb.id.cpu().numpy().astype(int)
+            vconfs = vb.conf.cpu().numpy()
+            vclses = vb.cls.cpu().numpy().astype(int)
+            for box, tid, conf, cls in zip(vxyxy, vids, vconfs, vclses):
+                if (person_boxes and cls in pdet.suppress_vehicle_classes
+                        and _explained_by_person(tuple(box), person_boxes)):
+                    continue
+                _accumulate(veh_tracks, detections, frame_idx, int(tid), box, conf, cls, img, W, H)
 
     # persist detections (for the evaluator)
     det_arr = np.array(detections, dtype=np.float32) if detections else np.zeros((0, 8), np.float32)
     np.save(out / "detections.npy", det_arr)
 
-    # build tracklet metadata + write crops
-    tracklets = []
-    for tid, acc in sorted(tracks.items()):
-        num = len(acc.frames)
-        subtype, entity_type = profiles.subtype_vote(acc.clses)
-        f_start, f_end = min(acc.frames), max(acc.frames)
-        ts_start = offset + f_start / fps
-        ts_end = offset + f_end / fps
-        crop_files = []
-        for k, crop in enumerate(acc.best_crops()):
-            fn = f"t{tid}_{k}.jpg"
-            cv2.imwrite(str(crops_dir / fn), crop)
-            crop_files.append(paths.rel_key(crops_dir / fn))
-        tracklets.append(
-            {
-                "tracklet_id": f"{scene}_{cam}_t{tid}",
+    def build(tracks, prefix, resolve):
+        """Turn a track-accumulator dict into tracklet metadata + write its crops.
+        prefix namespaces ids/crops/tracklet_ids ('t' vehicles, 'p' persons)."""
+        rows = []
+        for tid, acc in sorted(tracks.items()):
+            subtype, entity_type = resolve(acc)
+            f_start, f_end = min(acc.frames), max(acc.frames)
+            ts_start, ts_end = offset + f_start / fps, offset + f_end / fps
+            crop_files = []
+            for k, crop in enumerate(acc.best_crops()):
+                fn = f"{prefix}{tid}_{k}.jpg"
+                cv2.imwrite(str(crops_dir / fn), crop)
+                crop_files.append(paths.rel_key(crops_dir / fn))
+            rows.append({
+                "tracklet_id": f"{scene}_{cam}_{prefix}{tid}",
                 "scene": scene,
                 "camera_id": cam,
                 "track_id": int(tid),
                 "entity_type": entity_type,
                 "subtype": subtype,
-                "num_detections": num,
+                "num_detections": len(acc.frames),
                 "avg_conf": float(np.mean(acc.confs)),
                 "frame_start": int(f_start),
                 "frame_end": int(f_end),
@@ -152,9 +208,15 @@ def run(scene: str, cam: str, max_frames: int | None = None, device: int = 0) ->
                 "wall_start": paths.wall_time(ts_start).isoformat(),
                 "wall_end": paths.wall_time(ts_end).isoformat(),
                 "crop_refs": crop_files,
-            }
-        )
+            })
+        return rows
 
+    tracklets = (build(veh_tracks, "t", lambda acc: profiles.subtype_vote(acc.clses))
+                 + build(person_tracks, "p", lambda acc: ("person", "person")))
     (out / "tracklets.json").write_text(json.dumps(tracklets, indent=2))
-    del model
-    return {"cam": cam, "frames": frame_idx, "tracks": len(tracks), "detections": len(detections)}
+
+    del veh_model
+    if per_model is not None:
+        del per_model
+    return {"cam": cam, "frames": frame_idx, "tracks": len(veh_tracks),
+            "persons": len(person_tracks), "detections": len(detections)}

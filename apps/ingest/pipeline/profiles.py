@@ -10,9 +10,12 @@ things actually differ between CityFlow (US highway footage) and Indian urban CC
   * reid_onnx   : the re-ID appearance encoder (MUST output the locked 2048-d)
   * footage_dir : where this domain's source videos live under footage_data/
 
-Select with the INGEST_PROFILE env var (default "cityflow") or run_ingest --profile.
-CityFlow is the default so existing runs and the S01 eval baseline are unchanged; it is
-also the regression bench (the only footage with ground truth / an IDF1 number).
+Select with the INGEST_PROFILE env var (default "india") or run_ingest --profile.
+On this branch INDIA is the default — we work on and demo the real Surat (SUR01) footage.
+CityFlow is retained as the dormant REGRESSION BENCH: the only footage with ground truth
+(the S01 IDF1 / re-ID rank-1/5 numbers), run it explicitly with --profile cityflow
+(evaluate_reid.py still defaults to cityflow so scored eval is unchanged). Nothing CityFlow
+loads or runs unless it is explicitly selected.
 
 Both profiles must emit the same locked dims, so the DB / matcher / search / UI never
 fork — only detect + embed_reid select a knob here.
@@ -39,6 +42,19 @@ from constants import (  # noqa: E402
 
 
 @dataclass(frozen=True)
+class PersonDetector:
+    """A second, COCO-trained detector run alongside a vehicle-only primary to add
+    'person' entities (the india UVH-26 model has no person class). Its boxes are
+    tracked in a separate id namespace and can override person-confusable vehicle
+    boxes (a pedestrian mislabelled as a two-wheeler) at the merge step."""
+    weights: str                                 # stock COCO YOLO weights (has a 'person' class)
+    class_id: int                                # COCO person = 0
+    imgsz: int
+    conf: float
+    suppress_vehicle_classes: tuple[int, ...]    # vehicle class ids a person box may override (2-wheeler/bicycle)
+
+
+@dataclass(frozen=True)
 class Profile:
     name: str
     yolo_model: str                              # weights path/name for ultralytics.YOLO(...)
@@ -50,6 +66,7 @@ class Profile:
     default_subtype: str                         # for class ids not in class_map
     reid_onnx: str                               # filename under models/ (must be 2048-d)
     footage_dir: str                             # subdir under footage_data/ holding scenes
+    person_detector: PersonDetector | None = None  # optional 2nd detector for 'person' entities
 
 
 # CityFlow: stock YOLO11m on COCO ids (person/bicycle/car/motorcycle/bus/truck). This map
@@ -116,6 +133,21 @@ PROFILES: dict[str, Profile] = {
         default_subtype="other",
         reid_onnx="veri_reid.onnx",                 # until an India-tuned encoder is trained
         footage_dir="india",
+        # UVH-26 is vehicle-only; pair it with a CrowdHuman-trained person detector for people.
+        # Model chosen by A/B on SUR01 (Jul 2026): CrowdHuman YOLOv8n (yakhyo/yolov8-crowdhuman,
+        # native ultralytics, class {0:'person'}) BEAT stock YOLO11-X-COCO *and* a proprietary
+        # YOLOv8-X person model on Surat dense-crowd footage — training-domain match (packed,
+        # occluded crowds) dominates model size. imgsz 1280 (native-res recovers small/distant
+        # peds; far-crowd misses are a resolution wall only tiling/SAHI fixes), conf 0.25 (distant
+        # dets are low-conf, tracker prunes flicker). Suppress two-wheeler(7)/bicycle(11) boxes a
+        # same-sized person box explains (pedestrian FPs; real riders kept, bike box >1.9x rider).
+        person_detector=PersonDetector(
+            weights=str(_REPO_ROOT / "models" / "crowdhuman" / "yolov8n_crowdhuman.pt"),
+            class_id=0,
+            imgsz=1280,
+            conf=0.25,
+            suppress_vehicle_classes=(7, 11),
+        ),
     ),
 }
 
@@ -124,10 +156,10 @@ _ACTIVE: Profile | None = None
 
 
 def active() -> Profile:
-    """The selected profile (INGEST_PROFILE env, default 'cityflow'). Resolved once."""
+    """The selected profile (INGEST_PROFILE env, default 'india'). Resolved once."""
     global _ACTIVE
     if _ACTIVE is None:
-        name = os.environ.get("INGEST_PROFILE", "cityflow")
+        name = os.environ.get("INGEST_PROFILE", "india")
         if name not in PROFILES:
             raise KeyError(f"unknown INGEST_PROFILE {name!r}; have {list(PROFILES)}")
         _ACTIVE = PROFILES[name]

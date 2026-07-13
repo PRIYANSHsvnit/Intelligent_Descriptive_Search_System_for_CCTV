@@ -11,6 +11,7 @@ node_modules
 .env.development.local
 .env.test.local
 .env.production.local
+CLAUDE.md
 
 # Testing
 coverage
@@ -64,3 +65,6 @@ VeRi/
 
 # Downloaded detector weights (repo-root); large, fetched per-machine (see profiles.py india)
 /models/
+
+# throwaway detection sanity output
+apps/ingest/sanity_out*
