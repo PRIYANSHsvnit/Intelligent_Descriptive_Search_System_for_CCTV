@@ -1,6 +1,8 @@
 """Backend configuration. Model id MUST match the ingest lock (apps/ingest/constants.py)
 so query text vectors live in the same space as the stored image vectors."""
 
+import functools
+import json
 import os
 from pathlib import Path
 
@@ -22,6 +24,23 @@ CAM_LOC_DIR = REPO_ROOT / "footage_data" / "cam_loc"
 def scene_map_file(scene: str) -> Path:
     name = "S0345" if scene in ("S03", "S04", "S05") else scene
     return CAM_LOC_DIR / f"{name}.png"
+
+# Human-readable camera names for the UI (cam_labels/<scene>.json: camera_id -> label).
+# camera_id stays the functional key (media URLs, map positions); this is display-only,
+# so a missing file/entry harmlessly falls back to the raw id.
+CAM_LABEL_DIR = REPO_ROOT / "footage_data" / "cam_labels"
+
+
+@functools.lru_cache(maxsize=None)
+def _scene_labels(scene: str) -> dict[str, str]:
+    f = CAM_LABEL_DIR / f"{scene}.json"
+    if not f.exists():
+        return {}
+    return json.loads(f.read_text())
+
+
+def camera_label(scene: str, camera_id: str) -> str:
+    return _scene_labels(scene).get(camera_id, camera_id)
 
 # SigLIP text encoder device: CPU is plenty for one short query per search.
 DEVICE = os.environ.get("SEARCH_DEVICE", "cpu")

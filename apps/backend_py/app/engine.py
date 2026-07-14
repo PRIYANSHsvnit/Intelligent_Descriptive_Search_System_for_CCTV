@@ -125,6 +125,7 @@ def search(query, entity_type, scene, t0, t1, limit):
             "tracklet_id": r["tracklet_id"],
             "scene": r["scene"],
             "camera_id": r["camera_id"],
+            "camera_label": config.camera_label(r["scene"], r["camera_id"]),
             "subtype": r["subtype"],
             "color": r["color"],
             "ts_start_s": round(r["ts_start_s"], 2),
@@ -153,6 +154,7 @@ def trace(scene: str, global_id: int):
         {
             "tracklet_id": r["tracklet_id"],
             "camera_id": r["camera_id"],
+            "camera_label": config.camera_label(scene, r["camera_id"]),
             "ts_start_s": round(r["ts_start_s"], 2),
             "ts_end_s": round(r["ts_end_s"], 2),
             "ground_x": r["ground_x"],

@@ -9,6 +9,7 @@ type Result = {
   tracklet_id: string;
   scene: string;
   camera_id: string;
+  camera_label?: string;
   subtype: string;
   color: string | null;
   ts_start_s: number;
@@ -35,6 +36,7 @@ const CAM_POS: Record<string, Record<string, [number, number]>> = {
 type Hop = {
   tracklet_id: string;
   camera_id: string;
+  camera_label?: string;
   ts_start_s: number;
   ts_end_s: number;
   crop_url: string | null;
@@ -159,7 +161,7 @@ export default function Home() {
               <span className={styles.score}>{(r.score * 100).toFixed(0)}</span>
             </div>
             <div className={styles.metaSub}>
-              {r.camera_id} · {r.ts_start_s.toFixed(1)}–{r.ts_end_s.toFixed(1)}s
+              {r.camera_label ?? r.camera_id} · {r.ts_start_s.toFixed(1)}–{r.ts_end_s.toFixed(1)}s
             </div>
           </button>
         ))}
@@ -194,7 +196,7 @@ function Player({ result, onClose }: { result: Result; onClose: () => void }) {
           <strong>{result.tracklet_id}</strong>
           <span>
             {result.subtype}
-            {result.color ? ` · ${result.color}` : ""} · {result.camera_id} ·{" "}
+            {result.color ? ` · ${result.color}` : ""} · {result.camera_label ?? result.camera_id} ·{" "}
             {result.ts_start_s.toFixed(1)}–{result.ts_end_s.toFixed(1)}s
           </span>
           <button className={styles.close} onClick={onClose}>
@@ -300,7 +302,7 @@ function TraceView({ scene, globalId }: { scene: string; globalId: number }) {
                 <img className={styles.hopCrop} src={`${API}${h.crop_url}`} alt={h.camera_id} />
               )}
               <div className={styles.hopMeta}>
-                <strong>{h.camera_id}</strong>
+                <strong>{h.camera_label ?? h.camera_id}</strong>
                 <span>{h.ts_start_s.toFixed(1)}s</span>
               </div>
             </div>
