@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 
 import numpy as np
+from psycopg.types.json import Jsonb
 
 from . import paths
 from .db import connect
@@ -18,7 +19,7 @@ _COLS = [
     "tracklet_id", "scene", "camera_id", "entity_type", "subtype", "color",
     "frame_start", "frame_end", "ts_start_s", "ts_end_s", "wall_start", "wall_end",
     "num_detections", "avg_conf", "crop_refs", "video_ref",
-    "semantic_vector", "reid_appearance", "reid_color",
+    "semantic_vector", "reid_appearance", "reid_color", "person_attrs",
 ]
 _UPDATE = ", ".join(f"{c}=EXCLUDED.{c}" for c in _COLS if c != "tracklet_id")
 _SQL = (
@@ -63,6 +64,7 @@ def run(scene: str, cam: str, min_detections: int = 2) -> dict:
             semantic[i] if semantic is not None else None,
             reid_app[i] if reid_app is not None else None,
             reid_color[i] if reid_color is not None else None,
+            Jsonb(t["person_attrs"]) if t.get("person_attrs") else None,
         ))
 
     with connect() as conn, conn.cursor() as cur:

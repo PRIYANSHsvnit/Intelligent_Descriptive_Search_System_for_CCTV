@@ -2,7 +2,7 @@
 
 Runs stage-major (all cams through one stage before the next) so each GPU model is
 loaded/freed once per pass, per the VRAM strategy. Stages:
-  detect  -> attributes -> media -> siglip -> reid -> store
+  detect -> attributes -> media -> siglip -> color -> person_attrs -> vlm_attrs -> reid -> store
 
 Usage:
   uv run python run_ingest.py --scene S01
@@ -28,11 +28,18 @@ from pipeline import (  # noqa: E402
     embed_siglip,
     media,
     paths,
+    person_attrs,
     profiles,
     store,
+    vlm_attrs,
 )
 
-ALL_STAGES = ["detect", "attributes", "media", "siglip", "color", "reid", "store"]
+ALL_STAGES = ["detect", "attributes", "media", "siglip", "color", "person_attrs",
+              "vlm_attrs", "reid", "store"]
+# `vlm_attrs` = Qwen3-VL-4B via llama.cpp: structured person attributes with "unknown"
+# allowed, so unreadable crops abstain instead of mislabeling (validated on SUR01/c004 —
+# see plan.md "Person attributes" / the qwen3vl-person-attrs memory).
+DEFAULT_STAGES = list(ALL_STAGES)
 
 
 def main() -> int:
@@ -40,7 +47,7 @@ def main() -> int:
     ap.add_argument("--scene", default="SUR01")
     ap.add_argument("--cams", nargs="*", default=None, help="default: all cams in the scene")
     ap.add_argument("--max-frames", type=int, default=None)
-    ap.add_argument("--stages", nargs="*", default=ALL_STAGES, choices=ALL_STAGES)
+    ap.add_argument("--stages", nargs="*", default=DEFAULT_STAGES, choices=ALL_STAGES)
     ap.add_argument("--profile", default="india", choices=list(profiles.PROFILES),
                     help="domain profile (default india = real Surat footage; "
                          "use --profile cityflow --scene S01 for the ground-truth regression bench)")
@@ -67,6 +74,11 @@ def main() -> int:
         each("siglip", lambda c: embed_siglip.run(args.scene, c))
     if "color" in args.stages:
         each("color", lambda c: color_siglip.run(args.scene, c))
+    if "person_attrs" in args.stages:
+        each("person_attrs", lambda c: person_attrs.run(args.scene, c))
+    if "vlm_attrs" in args.stages:
+        each("vlm_attrs", lambda c: vlm_attrs.run(args.scene, c))
+        vlm_attrs.shutdown()      # free the ~4.7 GB of VRAM before the next GPU stage
     if "reid" in args.stages:
         each("reid", lambda c: embed_reid.run(args.scene, c))
     if "store" in args.stages:
