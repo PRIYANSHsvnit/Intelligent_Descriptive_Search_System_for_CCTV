@@ -310,6 +310,61 @@ Search query shape: `... WHERE entity_type='vehicle' [AND time range] ORDER BY s
 
 **Lock now (cheap now, migration later):** store **relative keys** in `crop_refs`/`video_ref` (e.g. `S01/c001/crops/t7_0.jpg`), never laptop-absolute paths like `/home/zer0/...`. The API resolves a key → the right URL, so switching tunnel ↔ object-store is a config change, not a DB rewrite.
 
+### Going live: recurring hourly ingest (DEFERRED — do NOT build for the demo)
+
+The schema above assumes scene-based one-shot ingest (run once per camera, done). Production
+use is different: police use it every day, footage arrives continuously, and we ingest it as
+an **offline batch every hour or so**. The columns barely change, but four things do — written
+down now so going live is a checklist, not a redesign. None of this is needed while ingest is
+one-shot per scene.
+
+1. **Batch-stamp `tracklet_id` (the one correctness item — MUST land with the first recurring
+   ingest).** Today `tracklet_id = {scene}_{cam}_t{tid}` where `tid` is the tracker's per-run
+   counter, which resets every run. Hour 2 therefore re-produces `SUR01_c001_t7`, and the
+   store stage's `ON CONFLICT DO UPDATE` upsert makes hour 2 **silently overwrite hour 1's
+   rows** (crop files under the same cam dir collide the same way). Fix: put the batch window
+   in the id and output paths, e.g. `SUR01_c001_2026071514_t7`. Bonus: re-running a *failed*
+   hour upserts the same ids — hourly ingest becomes naturally idempotent.
+
+2. **Wall time becomes the real query axis.** Police queries are wall-clock ("yesterday
+   14:00–16:00, camera X") and `ts_start_s` (seconds from scene start) stops meaning anything
+   when the "scene" runs forever. `wall_start/wall_end` flip from synthetic display clock to
+   real timestamps (batch start + in-clip offset); the backend filters on them instead of
+   `ts_*_s`. Rows arrive in time order, so a **BRIN index on `wall_start`** is nearly free and
+   ideal.
+
+3. **Partition `tracklets` by day.** The scale math makes this real, not hypothetical: the
+   c004 smoke test saw ~133 person tracklets in 30 s at a busy junction — with vehicles that's
+   ~25–30k tracklets/hour/camera at peak, plausibly **1–3M rows/day across 5 cams** (~13 KB of
+   vectors per row → tens of GB/day). Day partitions give: (a) **retention = `DROP PARTITION`**
+   (instant, no vacuum debt) — Indian CCTV practice is ~30–90 day retention, and the sweep must
+   also delete the crop/video files, which dwarf the DB; (b) a **local HNSW index per day**, so
+   index builds stay small; (c) time-scoped queries prune to 1–2 partitions, which also
+   neutralizes pgvector's filtered-ANN starvation (HNSW returns top-ef candidates *before* the
+   WHERE runs — a tight time filter over a global index starves; over a pruned partition it
+   doesn't). Note: the PK must then include the partition key (`wall_start`).
+
+4. **`ingest_batches` bookkeeping table** — what makes an unattended hourly job operable:
+
+   ```sql
+   CREATE TABLE ingest_batches (
+     camera_id  TEXT NOT NULL,
+     hour_start TIMESTAMPTZ NOT NULL,        -- the footage window this batch covers
+     status     TEXT NOT NULL,               -- 'running' | 'done' | 'failed'
+     row_count  INT, error TEXT,
+     started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ,
+     PRIMARY KEY (camera_id, hour_start)
+   );
+   ```
+
+   The scheduler asks it what's done / what to retry; ops sees ingest lag at a glance.
+
+Accepted trade-off: a tracklet straddling the hour cut is split in two. Search dedup already
+collapses same-camera same-subtype time-overlapping fragments, so we accept the split rather
+than engineer cross-batch track stitching. Optional when storage bites: `reid_appearance`
+(8.2 KB/row, only read by the offline cross-cam matcher) can move to `halfvec` or get a
+shorter retention than the searchable metadata.
+
 ---
 
 ## Implementation Detail — exact parameters (so nothing is ambiguous)
