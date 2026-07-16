@@ -350,6 +350,7 @@ one-shot per scene.
    CREATE TABLE ingest_batches (
      camera_id  TEXT NOT NULL,
      hour_start TIMESTAMPTZ NOT NULL,        -- the footage window this batch covers
+     file_path  TEXT,                        -- raw footage for this window (cold storage)
      status     TEXT NOT NULL,               -- 'running' | 'done' | 'failed'
      row_count  INT, error TEXT,
      started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ,
@@ -358,6 +359,8 @@ one-shot per scene.
    ```
 
    The scheduler asks it what's done / what to retry; ops sees ingest lag at a glance.
+   `file_path` also makes this the pointer back to the raw footage of that window —
+   a batch row *is* the video segment, so no separate `video_segments` table is needed.
 
 Accepted trade-off: a tracklet straddling the hour cut is split in two. Search dedup already
 collapses same-camera same-subtype time-overlapping fragments, so we accept the split rather
