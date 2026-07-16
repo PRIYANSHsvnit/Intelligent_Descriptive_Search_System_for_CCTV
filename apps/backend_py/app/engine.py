@@ -18,7 +18,8 @@ _model = None
 
 
 def load_model() -> None:
-    """Load the SigLIP text/image model once (we only call the text tower)."""
+    """Load the SigLIP text/image model once (text tower for q=, image tower for
+    reference-image search — both encode into the same 1152-d space)."""
     global _processor, _model
     if _model is not None:
         return
@@ -33,6 +34,18 @@ def encode_text(query: str) -> np.ndarray:
     ).to(config.DEVICE)
     with torch.no_grad():
         feats = _model.get_text_features(**inp)
+        if not isinstance(feats, torch.Tensor):  # transformers 5.x output object
+            feats = feats.pooler_output
+        feats = torch.nn.functional.normalize(feats, dim=-1)
+    return feats[0].float().cpu().numpy()
+
+
+def encode_image(img) -> np.ndarray:
+    """PIL image → L2-normalized 1152-d vector, same space as stored crop vectors.
+    Expects a tight crop of the object (a full frame embeds 'street scene')."""
+    inp = _processor(images=[img.convert("RGB")], return_tensors="pt")
+    with torch.no_grad():
+        feats = _model.get_image_features(pixel_values=inp.pixel_values.to(config.DEVICE))
         if not isinstance(feats, torch.Tensor):  # transformers 5.x output object
             feats = feats.pooler_output
         feats = torch.nn.functional.normalize(feats, dim=-1)
@@ -227,8 +240,29 @@ def search_plate(plate_query, scene, limit, min_sim=0.30):
     return {"results": results, "fell_back": False}
 
 
-def search(query, entity_type, scene, t0, t1, limit):
-    qvec = encode_text(query)
+def _shape_result(r: dict) -> dict:
+    return {
+        "tracklet_id": r["tracklet_id"],
+        "scene": r["scene"],
+        "camera_id": r["camera_id"],
+        "camera_label": config.camera_label(r["scene"], r["camera_id"]),
+        "subtype": r["subtype"],
+        "color": r["color"],
+        "ts_start_s": round(r["ts_start_s"], 2),
+        "ts_end_s": round(r["ts_end_s"], 2),
+        **_video_window(r["scene"], r["camera_id"], r["ts_start_s"], r["ts_end_s"]),
+        "score": round(float(r["score"]), 4),
+        "crop_url": _crop_url(r),
+        "video_url": f"/media/{r['scene']}/{r['camera_id']}" if r["video_ref"] else None,
+        "global_id": r["global_id"],
+        "attrs": _attr_tags(r.get("person_attrs")),
+        "plate": r.get("plate_text"),
+        "plate_conf": r.get("plate_conf"),
+    }
+
+
+def _search_with_vec(qvec, entity_type, scene, t0, t1, limit):
+    """Shared tail for text and image queries: pgvector search + fail-open + dedup."""
     fetch = max(limit * 4, 40)  # over-fetch so dedup still returns ~limit
     rows = _run_query(qvec, entity_type, scene, t0, t1, fetch)
 
@@ -239,28 +273,75 @@ def search(query, entity_type, scene, t0, t1, limit):
         fell_back = True
 
     rows = _dedup(rows)[:limit]
-    results = [
-        {
-            "tracklet_id": r["tracklet_id"],
-            "scene": r["scene"],
-            "camera_id": r["camera_id"],
-            "camera_label": config.camera_label(r["scene"], r["camera_id"]),
-            "subtype": r["subtype"],
-            "color": r["color"],
-            "ts_start_s": round(r["ts_start_s"], 2),
-            "ts_end_s": round(r["ts_end_s"], 2),
-            **_video_window(r["scene"], r["camera_id"], r["ts_start_s"], r["ts_end_s"]),
-            "score": round(float(r["score"]), 4),
-            "crop_url": _crop_url(r),
-            "video_url": f"/media/{r['scene']}/{r['camera_id']}" if r["video_ref"] else None,
-            "global_id": r["global_id"],
-            "attrs": _attr_tags(r.get("person_attrs")),
-            "plate": r.get("plate_text"),
-            "plate_conf": r.get("plate_conf"),
+    return {"results": [_shape_result(r) for r in rows], "fell_back": fell_back}
+
+
+def search(query, entity_type, scene, t0, t1, limit):
+    return _search_with_vec(encode_text(query), entity_type, scene, t0, t1, limit)
+
+
+def search_image(img, entity_type, scene, t0, t1, limit):
+    """Reference-image search: SigLIP image tower → same vector space as text.
+    NOTE image↔image scores run much higher than text↔image (modality gap) —
+    ranking is comparable, absolute scores are not."""
+    return _search_with_vec(encode_image(img), entity_type, scene, t0, t1, limit)
+
+
+# "more like this": the stored vectors ARE valid query vectors, so similarity search
+# by an existing tracklet needs no encoder at all. semantic = looks-alike (SigLIP);
+# reid = same-instance appearance (2048-d re-ID embedding, what it's trained for).
+_SIMILAR_COLS = {"semantic": "semantic_vector", "reid": "reid_appearance"}
+
+
+def search_similar(tracklet_id: str, vec: str, limit: int):
+    src_sql = """
+        SELECT semantic_vector AS sem, reid_appearance AS reid,
+               scene, global_id, entity_type
+        FROM tracklets WHERE tracklet_id = %s
+    """
+    with _connect() as conn, conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+        cur.execute(src_sql, (tracklet_id,))
+        src = cur.fetchone()
+        if src is None:
+            return None
+        col = _SIMILAR_COLS[vec]
+        qv = src["reid"] if vec == "reid" else src["sem"]
+        fell_back = False
+        if qv is None and vec == "reid":
+            # fail open: no re-ID vector stored (e.g. SUR01) — use visual similarity
+            qv, col, fell_back = src["sem"], "semantic_vector", True
+        if qv is None:
+            return {"results": [], "fell_back": fell_back}
+
+        # same entity_type only: person and vehicle re-ID vectors come from different
+        # encoders (and cross-type "similar" is meaningless for semantic too). Exclude
+        # the source object itself — its own sightings are /trace's job, not search's.
+        where = [f"{col} IS NOT NULL", "entity_type = %(etype)s",
+                 "tracklet_id <> %(tid)s"]
+        params = {
+            "q": qv,  # pgvector Vector round-trips as-is
+            "etype": src["entity_type"],
+            "tid": tracklet_id,
+            "lim": max(limit * 4, 40),
         }
-        for r in rows
-    ]
-    return {"results": results, "fell_back": fell_back}
+        if src["global_id"] is not None:
+            where.append("NOT (scene = %(sscene)s AND global_id = %(sgid)s)")
+            params["sscene"], params["sgid"] = src["scene"], src["global_id"]
+        sql = f"""
+            SELECT tracklet_id, scene, camera_id, subtype, color, entity_type,
+                   ts_start_s, ts_end_s, crop_refs, video_ref, global_id, person_attrs,
+                   plate_text, plate_conf,
+                   1 - ({col} <=> %(q)s) AS score
+            FROM tracklets
+            WHERE {' AND '.join(where)}
+            ORDER BY {col} <=> %(q)s
+            LIMIT %(lim)s
+        """
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+
+    rows = _dedup(rows)[:limit]
+    return {"results": [_shape_result(r) for r in rows], "fell_back": fell_back}
 
 
 def trace(scene: str, global_id: int):

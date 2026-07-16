@@ -78,7 +78,7 @@ type Hop = {
 
 export default function Home() {
   const [q, setQ] = useState("man wearing a cap");
-  const [mode, setMode] = useState<"desc" | "plate">("desc");
+  const [mode, setMode] = useState<"desc" | "plate" | "photo">("desc");
   const [type, setType] = useState("");
   const [scene, setScene] = useState("SUR01");
   const [results, setResults] = useState<Result[]>([]);
@@ -87,12 +87,19 @@ export default function Home() {
   const [searched, setSearched] = useState(false);
   const [active, setActive] = useState<Result | null>(null);
   const [traceGid, setTraceGid] = useState<number | null>(null);
+  const [imgFile, setImgFile] = useState<File | null>(null);
+  const [imgPreview, setImgPreview] = useState<string | null>(null);
+  // what a photo / find-similar result set is relative to (shown as a notice)
+  const [context, setContext] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   const runSearch = useCallback(
     async (query: string) => {
       if (!query.trim()) return;
       setLoading(true);
       setSearched(true);
+      setContext(null);
+      setError(null);
       try {
         const p = new URLSearchParams({ limit: "24" });
         if (mode === "plate") {
@@ -103,16 +110,90 @@ export default function Home() {
         }
         if (scene) p.set("scene", scene);
         const r = await fetch(`${API}/search?${p}`);
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const data = await r.json();
         setResults(data.results ?? []);
         setFellBack(Boolean(data.fell_back));
-      } catch {
+      } catch (e) {
         setResults([]);
+        setError(`Search failed (${e instanceof Error ? e.message : "network"}) — is the backend up to date?`);
       } finally {
         setLoading(false);
       }
     },
     [mode, type, scene],
+  );
+
+  // reference-image search: multipart POST, same response shape as text search
+  const runImageSearch = useCallback(
+    async (file: File) => {
+      setLoading(true);
+      setSearched(true);
+      setContext("matches for the uploaded photo");
+      setError(null);
+      try {
+        const fd = new FormData();
+        fd.append("image", file);
+        if (type) fd.append("type", type);
+        if (scene) fd.append("scene", scene);
+        fd.append("limit", "24");
+        const r = await fetch(`${API}/search/image`, { method: "POST", body: fd });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const data = await r.json();
+        setResults(data.results ?? []);
+        setFellBack(Boolean(data.fell_back));
+      } catch (e) {
+        setResults([]);
+        setError(`Image search failed (${e instanceof Error ? e.message : "network"}) — is the backend up to date?`);
+      } finally {
+        setLoading(false);
+      }
+    },
+    [type, scene],
+  );
+
+  // more-like-this from a stored tracklet (no upload; server reuses stored vectors)
+  const runSimilar = useCallback(async (r: Result, vec: "semantic" | "reid") => {
+    setActive(null);
+    setLoading(true);
+    setSearched(true);
+    setContext(
+      vec === "reid"
+        ? `re-ID matches for ${r.subtype} ${r.tracklet_id} (same object, other sightings)`
+        : `tracklets that look similar to ${r.subtype} ${r.tracklet_id}`,
+    );
+    setError(null);
+    try {
+      const p = new URLSearchParams({ tracklet_id: r.tracklet_id, vec, limit: "24" });
+      const res = await fetch(`${API}/search/similar?${p}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setResults(data.results ?? []);
+      setFellBack(false);
+      if (data.fell_back && vec === "reid") {
+        setContext(
+          `look-alikes of ${r.subtype} ${r.tracklet_id} (no re-ID vector stored — visual similarity only)`,
+        );
+      }
+    } catch (e) {
+      setResults([]);
+      setError(`Similar search failed (${e instanceof Error ? e.message : "network"}) — is the backend up to date?`);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const onPickImage = useCallback(
+    (f: File | null) => {
+      if (!f) return;
+      setImgFile(f);
+      setImgPreview((old) => {
+        if (old) URL.revokeObjectURL(old);
+        return URL.createObjectURL(f);
+      });
+      runImageSearch(f); // search immediately on pick
+    },
+    [runImageSearch],
   );
 
   // run the default query once on mount; support ?trace=<gid> deep-link to a path
@@ -128,7 +209,8 @@ export default function Home() {
       <header className={styles.header}>
         <h1 className={styles.title}>CCTV Descriptive Search</h1>
         <p className={styles.subtitle}>
-          Describe a vehicle in plain words — get every matching clip across cameras.
+          Describe a vehicle in plain words — or upload a photo — get every matching clip
+          across cameras.
         </p>
       </header>
 
@@ -136,24 +218,47 @@ export default function Home() {
         className={styles.searchBar}
         onSubmit={(e) => {
           e.preventDefault();
-          runSearch(q);
+          if (mode === "photo") {
+            if (imgFile) runImageSearch(imgFile);
+          } else {
+            runSearch(q);
+          }
         }}
       >
         <select
           className={styles.select}
           value={mode}
-          onChange={(e) => setMode(e.target.value as "desc" | "plate")}
+          onChange={(e) => setMode(e.target.value as "desc" | "plate" | "photo")}
         >
           <option value="desc">describe</option>
           <option value="plate">plate no.</option>
+          <option value="photo">photo</option>
         </select>
-        <input
-          className={styles.input}
-          value={q}
-          onChange={(e) => setQ(e.target.value)}
-          placeholder={mode === "plate" ? "e.g. GJ05JP4237 or just 4237" : "e.g. white pickup truck"}
-        />
-        {mode === "desc" && (
+        {mode === "photo" ? (
+          <label className={styles.fileLabel}>
+            {imgPreview && (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img className={styles.filePreview} src={imgPreview} alt="query" />
+            )}
+            <span>
+              {imgFile ? imgFile.name : "upload a cropped photo of the vehicle/person…"}
+            </span>
+            <input
+              type="file"
+              accept="image/*"
+              hidden
+              onChange={(e) => onPickImage(e.target.files?.[0] ?? null)}
+            />
+          </label>
+        ) : (
+          <input
+            className={styles.input}
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder={mode === "plate" ? "e.g. GJ05JP4237 or just 4237" : "e.g. white pickup truck"}
+          />
+        )}
+        {mode !== "plate" && (
           <select className={styles.select} value={type} onChange={(e) => setType(e.target.value)}>
             <option value="">any type</option>
             <option value="vehicle">vehicle</option>
@@ -171,7 +276,7 @@ export default function Home() {
       </form>
 
       <div className={styles.examples}>
-        {(mode === "plate" ? PLATE_EXAMPLES : EXAMPLES).map((ex) => (
+        {(mode === "photo" ? [] : mode === "plate" ? PLATE_EXAMPLES : EXAMPLES).map((ex) => (
           <button
             key={ex}
             className={styles.chip}
@@ -190,6 +295,10 @@ export default function Home() {
           No matches for those filters — showing the closest results instead.
         </div>
       )}
+      {context && !loading && !error && (
+        <div className={styles.notice}>Showing {context}.</div>
+      )}
+      {error && !loading && <div className={styles.notice}>{error}</div>}
 
       {loading && <div className={styles.status}>Searching…</div>}
       {!loading && searched && results.length === 0 && (
@@ -247,7 +356,9 @@ export default function Home() {
         ))}
       </div>
 
-      {active && <Player result={active} onClose={() => setActive(null)} />}
+      {active && (
+        <Player result={active} onClose={() => setActive(null)} onSimilar={runSimilar} />
+      )}
       {traceGid != null && (
         <div className={styles.overlay} onClick={() => setTraceGid(null)}>
           <div className={styles.player} onClick={(e) => e.stopPropagation()}>
@@ -265,7 +376,15 @@ export default function Home() {
   );
 }
 
-function Player({ result, onClose }: { result: Result; onClose: () => void }) {
+function Player({
+  result,
+  onClose,
+  onSimilar,
+}: {
+  result: Result;
+  onClose: () => void;
+  onSimilar: (r: Result, vec: "semantic" | "reid") => void;
+}) {
   const ref = useRef<HTMLVideoElement>(null);
   const src = result.video_url ? `${API}${result.video_url}` : null;
   // seek in video-file time (scene-clock minus camera offset); older rows without it
@@ -285,6 +404,20 @@ function Player({ result, onClose }: { result: Result; onClose: () => void }) {
             {fmt(result.ts_start_s)}–{fmt(result.ts_end_s)}
             {result.video_start_s != null && ` (${fmtClip(result.video_start_s)} in clip)`}
           </span>
+          <button
+            className={styles.simBtn}
+            title="other objects that look like this one (SigLIP)"
+            onClick={() => onSimilar(result, "semantic")}
+          >
+            similar look
+          </button>
+          <button
+            className={styles.simBtn}
+            title="other sightings of this exact object (re-ID appearance)"
+            onClick={() => onSimilar(result, "reid")}
+          >
+            same object
+          </button>
           <button className={styles.close} onClick={onClose}>
             ✕
           </button>

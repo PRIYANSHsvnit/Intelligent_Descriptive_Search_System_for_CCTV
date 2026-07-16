@@ -3,6 +3,8 @@
 Endpoints (see plan.md API contract):
   GET /search?q=&type=&scene=&t0=&t1=&limit=  -> ranked, de-duplicated tracklets
   GET /search?plate=&scene=&limit=            -> layered plate lookup (exact/partial/fuzzy)
+  POST /search/image (multipart)              -> reference-image search (SigLIP image tower)
+  GET /search/similar?tracklet_id=&vec=       -> more-like-this from a stored tracklet
   GET /media/{scene}/{camera}                 -> per-camera H.264/MP4 (HTTP range)
   GET /trace/{scene}/{global_id}              -> cross-camera hops (Phase 3 data)
   /files/<crop_ref>                           -> crop thumbnails (static)
@@ -12,12 +14,14 @@ Auth (hackathon posture): none — one shared local DB. Don't build accounts.
 
 from __future__ import annotations
 
+import io
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from PIL import Image
 
 from . import config, engine
 
@@ -62,6 +66,40 @@ def search(
     if not q:
         raise HTTPException(422, "provide q (description) or plate")
     return engine.search(q, type, scene, t0, t1, limit)
+
+
+@app.post("/search/image")
+async def search_image(
+    image: UploadFile = File(..., description="tight crop of the vehicle/person"),
+    type: str | None = Form(None),
+    scene: str | None = Form(None),
+    t0: float | None = Form(None),
+    t1: float | None = Form(None),
+    limit: int = Form(20),
+):
+    if type and type not in ("vehicle", "person"):
+        raise HTTPException(422, "type must be 'vehicle' or 'person'")
+    data = await image.read()
+    try:
+        img = Image.open(io.BytesIO(data))
+        img.load()
+    except Exception:
+        raise HTTPException(422, "could not decode image")
+    return engine.search_image(img, type or None, scene or None, t0, t1,
+                               min(max(limit, 1), 100))
+
+
+@app.get("/search/similar")
+def search_similar(
+    tracklet_id: str,
+    vec: str = Query("semantic", pattern="^(semantic|reid)$",
+                     description="semantic = looks similar, reid = same instance"),
+    limit: int = Query(20, ge=1, le=100),
+):
+    out = engine.search_similar(tracklet_id, vec, limit)
+    if out is None:
+        raise HTTPException(404, f"no tracklet {tracklet_id}")
+    return out
 
 
 @app.get("/media/{scene}/{camera}")

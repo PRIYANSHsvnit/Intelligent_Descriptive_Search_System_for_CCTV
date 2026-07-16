@@ -62,6 +62,45 @@
   background: #3a7bee;
 }
 
+.fileLabel {
+  flex: 1 1 320px;
+  min-width: 220px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-radius: 10px;
+  border: 1px dashed #2a2d36;
+  background: #16181d;
+  color: #9aa0ac;
+  font-size: 14px;
+  cursor: pointer;
+}
+.fileLabel:hover {
+  border-color: #4c8bf5;
+  color: #e9e9ee;
+}
+.filePreview {
+  width: 34px;
+  height: 34px;
+  object-fit: cover;
+  border-radius: 6px;
+}
+.simBtn {
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid #2a2d36;
+  background: transparent;
+  color: #9aa0ac;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.simBtn:hover {
+  color: #e9e9ee;
+  border-color: #4c8bf5;
+}
+
 .examples {
   display: flex;
   gap: 8px;
