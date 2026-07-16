@@ -14,6 +14,8 @@ type Result = {
   color: string | null;
   ts_start_s: number;
   ts_end_s: number;
+  video_start_s?: number;
+  video_end_s?: number;
   score: number;
   crop_url: string | null;
   video_url: string | null;
@@ -21,6 +23,7 @@ type Result = {
   attrs?: string[];
   plate?: string | null;
   plate_conf?: number | null;
+  sightings?: number;
   matched_on?: "exact" | "partial" | "fuzzy";
 };
 
@@ -35,6 +38,20 @@ const EXAMPLES = [
 
 // registration queries: full plate or any fragment (last-4 digits is the realistic case)
 const PLATE_EXAMPLES = ["GJ05JP4237", "GJ05CU6121", "GJ18Z8995", "4237", "GJ08"];
+
+// scene-clock seconds -> time of day h:mm:ss (offsets are seconds since midnight)
+function fmt(t: number): string {
+  const h = Math.floor(t / 3600);
+  const m = Math.floor((t % 3600) / 60);
+  const s = Math.floor(t % 60);
+  const ss = String(s).padStart(2, "0");
+  return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${ss}` : `${m}:${ss}`;
+}
+
+// video-local seconds -> m:ss position inside the clip
+function fmtClip(t: number): string {
+  return `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, "0")}`;
+}
 
 // Hand-annotated camera pixel positions (normalized 0..1) on cam_loc/<scene>.png.
 const CAM_POS: Record<string, Record<string, [number, number]>> = {
@@ -53,6 +70,8 @@ type Hop = {
   camera_label?: string;
   ts_start_s: number;
   ts_end_s: number;
+  video_start_s?: number;
+  video_end_s?: number;
   crop_url: string | null;
   video_url: string | null;
 };
@@ -192,7 +211,8 @@ export default function Home() {
               <span className={styles.score}>{(r.score * 100).toFixed(0)}</span>
             </div>
             <div className={styles.metaSub}>
-              {r.camera_label ?? r.camera_id} · {r.ts_start_s.toFixed(1)}–{r.ts_end_s.toFixed(1)}s
+              {r.camera_label ?? r.camera_id} · {fmt(r.ts_start_s)}–{fmt(r.ts_end_s)}
+              {r.video_start_s != null && ` · ${fmtClip(r.video_start_s)} in clip`}
             </div>
             {(r.plate || r.matched_on) && (
               <div className={styles.plateRow}>
@@ -203,6 +223,9 @@ export default function Home() {
                       {(r.plate_conf ?? 0) >= 0.8 ? "confirmed" : "probable"}
                     </span>
                   </span>
+                )}
+                {(r.sightings ?? 0) > 1 && (
+                  <span className={styles.matchTag}>{r.sightings} sightings</span>
                 )}
                 {r.matched_on && r.matched_on !== "exact" && (
                   <span className={styles.matchTag}>
@@ -245,6 +268,10 @@ export default function Home() {
 function Player({ result, onClose }: { result: Result; onClose: () => void }) {
   const ref = useRef<HTMLVideoElement>(null);
   const src = result.video_url ? `${API}${result.video_url}` : null;
+  // seek in video-file time (scene-clock minus camera offset); older rows without it
+  // fall back to the scene timestamps (S01, where offsets are ~0)
+  const seek0 = result.video_start_s ?? result.ts_start_s;
+  const seek1 = result.video_end_s ?? result.ts_end_s;
 
   return (
     <div className={styles.overlay} onClick={onClose}>
@@ -255,7 +282,8 @@ function Player({ result, onClose }: { result: Result; onClose: () => void }) {
             {result.subtype}
             {result.color ? ` · ${result.color}` : ""}
             {result.plate ? ` · ${result.plate}` : ""} · {result.camera_label ?? result.camera_id} ·{" "}
-            {result.ts_start_s.toFixed(1)}–{result.ts_end_s.toFixed(1)}s
+            {fmt(result.ts_start_s)}–{fmt(result.ts_end_s)}
+            {result.video_start_s != null && ` (${fmtClip(result.video_start_s)} in clip)`}
           </span>
           <button className={styles.close} onClick={onClose}>
             ✕
@@ -269,12 +297,12 @@ function Player({ result, onClose }: { result: Result; onClose: () => void }) {
             controls
             autoPlay
             onLoadedMetadata={() => {
-              if (ref.current) ref.current.currentTime = result.ts_start_s;
+              if (ref.current) ref.current.currentTime = seek0;
             }}
             onTimeUpdate={() => {
               const v = ref.current;
-              if (v && v.currentTime >= result.ts_end_s) {
-                v.currentTime = result.ts_start_s; // loop the object's window
+              if (v && v.currentTime >= seek1) {
+                v.currentTime = seek0; // loop the object's window
               }
             }}
           />
@@ -321,9 +349,12 @@ function TraceView({ scene, globalId }: { scene: string; globalId: number }) {
       <div className={styles.traceHead}>
         {single
           ? "Seen in a single camera (no cross-camera path)."
-          : `Cross-camera path · ${hops.length} sightings across ${camsInPath.size} cameras`}
+          : camsInPath.size === 1
+            ? `${hops.length} sightings in this camera (fragments stitched by plate)`
+            : `Cross-camera path · ${hops.length} sightings across ${camsInPath.size} cameras`}
       </div>
-      <div className={styles.traceBody}>
+      <div className={styles.traceBody} style={Object.keys(positions).length === 0 ? { gridTemplateColumns: "1fr" } : undefined}>
+        {Object.keys(positions).length > 0 && (
         <div className={styles.mapWrap}>
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img className={styles.mapImg} src={`${API}/scene-map/${scene}`} alt="scene map" />
@@ -352,6 +383,7 @@ function TraceView({ scene, globalId }: { scene: string; globalId: number }) {
             ))}
           </svg>
         </div>
+        )}
         <div className={styles.timeline}>
           {hops.map((h, i) => (
             <div key={`${h.tracklet_id}-${i}`} className={styles.hop}>
@@ -361,7 +393,9 @@ function TraceView({ scene, globalId }: { scene: string; globalId: number }) {
               )}
               <div className={styles.hopMeta}>
                 <strong>{h.camera_label ?? h.camera_id}</strong>
-                <span>{h.ts_start_s.toFixed(1)}s</span>
+                <span title={h.video_start_s != null ? `${fmtClip(h.video_start_s)} into the clip` : undefined}>
+                  {fmt(h.ts_start_s)}
+                </span>
               </div>
             </div>
           ))}

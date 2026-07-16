@@ -42,5 +42,27 @@ def _scene_labels(scene: str) -> dict[str, str]:
 def camera_label(scene: str, camera_id: str) -> str:
     return _scene_labels(scene).get(camera_id, camera_id)
 
+# Per-camera clock offsets (cam_timestamp/<scene>.txt: "<cam> <seconds>"). Stored
+# tracklet timestamps are scene-clock (offset included); the video file starts at the
+# offset, so player seeks need ts - offset. Missing file -> 0 (ts already video-local).
+CAM_TS_DIR = REPO_ROOT / "footage_data" / "cam_timestamp"
+
+
+@functools.lru_cache(maxsize=None)
+def _scene_offsets(scene: str) -> dict[str, float]:
+    f = CAM_TS_DIR / f"{scene}.txt"
+    if not f.exists():
+        return {}
+    out = {}
+    for line in f.read_text().splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            out[parts[0]] = float(parts[1])
+    return out
+
+
+def camera_offset(scene: str, camera_id: str) -> float:
+    return _scene_offsets(scene).get(camera_id, 0.0)
+
 # SigLIP text encoder device: CPU is plenty for one short query per search.
 DEVICE = os.environ.get("SEARCH_DEVICE", "cpu")

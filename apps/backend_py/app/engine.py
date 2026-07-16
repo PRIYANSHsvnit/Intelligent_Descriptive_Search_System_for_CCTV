@@ -84,13 +84,14 @@ def _dedup(rows: list[dict]) -> list[dict]:
     or same-camera same-subtype fragments overlapping in time. Keeps best score
     (rows arrive score-desc)."""
     kept: list[dict] = []
-    seen_gid: set[int] = set()
+    seen_gid: set[tuple[str, int]] = set()  # gids are scene-namespaced
     for r in rows:
         gid = r.get("global_id")
         if gid is not None:
-            if gid in seen_gid:
+            key = (r["scene"], gid)
+            if key in seen_gid:
                 continue
-            seen_gid.add(gid)
+            seen_gid.add(key)
             kept.append(r)
             continue
         dup = any(
@@ -109,6 +110,16 @@ def _dedup(rows: list[dict]) -> list[dict]:
 def _crop_url(row: dict) -> str | None:
     refs = row.get("crop_refs")
     return f"/files/{refs[0]}" if refs else None
+
+
+def _video_window(scene: str, cam: str, ts0: float, ts1: float) -> dict:
+    """Stored timestamps are scene-clock; the per-camera video file starts at the
+    camera's offset — subtract it so the player can seek."""
+    off = config.camera_offset(scene, cam)
+    return {
+        "video_start_s": round(max(0.0, ts0 - off), 2),
+        "video_end_s": round(max(0.0, ts1 - off), 2),
+    }
 
 
 def _attr_tags(pa: dict | None) -> list[str]:
@@ -145,14 +156,17 @@ _PLATE_SELECT = """
            COALESCE(plate_text ILIKE %(pat)s, false)
              OR COALESCE(plate_raw ILIKE %(pat)s, false) AS substr,
            GREATEST(COALESCE(similarity(plate_text, %(p)s), 0),
-                    COALESCE(similarity(plate_raw, %(p)s), 0)) AS sim
+                    COALESCE(similarity(plate_raw, %(p)s), 0)) AS sim,
+           COUNT(*) OVER (PARTITION BY scene, COALESCE(global_id::text, tracklet_id))
+             AS sightings
     FROM tracklets
     WHERE (plate_text IS NOT NULL OR plate_raw IS NOT NULL) {extra}
       AND (plate_text = %(p)s
            OR plate_text ILIKE %(pat)s OR plate_raw ILIKE %(pat)s
            OR similarity(plate_text, %(p)s) > %(minsim)s
            OR similarity(plate_raw, %(p)s) > %(minsim)s)
-    ORDER BY exact DESC, substr DESC, (plate_text IS NOT NULL) DESC, sim DESC
+    ORDER BY exact DESC, substr DESC, (plate_text IS NOT NULL) DESC, sim DESC,
+             (ts_end_s - ts_start_s) DESC
     LIMIT %(lim)s
 """
 
@@ -174,6 +188,18 @@ def search_plate(plate_query, scene, limit, min_sim=0.30):
     with _connect() as conn, conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
         cur.execute(_PLATE_SELECT.format(extra=extra), params)
         rows = cur.fetchall()
+    # plate-stitched tracklets share a global_id — one card per physical vehicle
+    # (rows arrive best-tier-first, so the kept row is the strongest match)
+    seen: set[tuple[str, int]] = set()
+    deduped = []
+    for r in rows:
+        gid = r.get("global_id")
+        if gid is not None:
+            if (r["scene"], gid) in seen:
+                continue
+            seen.add((r["scene"], gid))
+        deduped.append(r)
+    rows = deduped
     results = [
         {
             "tracklet_id": r["tracklet_id"],
@@ -184,6 +210,7 @@ def search_plate(plate_query, scene, limit, min_sim=0.30):
             "color": r["color"],
             "ts_start_s": round(r["ts_start_s"], 2),
             "ts_end_s": round(r["ts_end_s"], 2),
+            **_video_window(r["scene"], r["camera_id"], r["ts_start_s"], r["ts_end_s"]),
             "score": round(float(r["sim"]), 4),
             "crop_url": _crop_url(r),
             "video_url": f"/media/{r['scene']}/{r['camera_id']}" if r["video_ref"] else None,
@@ -191,6 +218,7 @@ def search_plate(plate_query, scene, limit, min_sim=0.30):
             "attrs": _attr_tags(r.get("person_attrs")),
             "plate": r["plate_text"],
             "plate_conf": r["plate_conf"],
+            "sightings": r["sightings"],
             "matched_on": ("exact" if r["exact"] else
                            "partial" if r["substr"] else "fuzzy"),
         }
@@ -221,6 +249,7 @@ def search(query, entity_type, scene, t0, t1, limit):
             "color": r["color"],
             "ts_start_s": round(r["ts_start_s"], 2),
             "ts_end_s": round(r["ts_end_s"], 2),
+            **_video_window(r["scene"], r["camera_id"], r["ts_start_s"], r["ts_end_s"]),
             "score": round(float(r["score"]), 4),
             "crop_url": _crop_url(r),
             "video_url": f"/media/{r['scene']}/{r['camera_id']}" if r["video_ref"] else None,
@@ -251,6 +280,7 @@ def trace(scene: str, global_id: int):
             "camera_label": config.camera_label(scene, r["camera_id"]),
             "ts_start_s": round(r["ts_start_s"], 2),
             "ts_end_s": round(r["ts_end_s"], 2),
+            **_video_window(scene, r["camera_id"], r["ts_start_s"], r["ts_end_s"]),
             "ground_x": r["ground_x"],
             "ground_y": r["ground_y"],
             "crop_url": f"/files/{r['crop_refs'][0]}" if r["crop_refs"] else None,
