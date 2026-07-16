@@ -2,9 +2,13 @@
 
   uv run python reid_match.py --scene S01 --sweep        # tune threshold x w by IDF1
   uv run python reid_match.py --scene S01 --threshold 0.5 --w 0   # commit global_id to DB
+  uv run python reid_match.py --scene SUR01 --plates-only        # plate-based stitching
 
 --sweep evaluates each (threshold, w) with the real IDF1 harness and reports the grid;
 the plain run writes global_ids.json AND updates tracklets.global_id in Postgres.
+--plates-only disables appearance edges (threshold > max cosine) and writes global_id
+only for multi-tracklet plate groups — the stitching mode for SUR01, where appearance
+matching is untrusted but a shared validated plate_text is proof of identity.
 """
 
 from __future__ import annotations
@@ -23,6 +27,9 @@ def main() -> int:
     ap.add_argument("--threshold", type=float, default=0.5)
     ap.add_argument("--w", type=float, default=0.0)
     ap.add_argument("--sweep", action="store_true")
+    ap.add_argument("--plates-only", action="store_true",
+                    help="stitch by plate_text must-links only; no appearance edges; "
+                         "write gids only for multi-tracklet groups")
     args = ap.parse_args()
     cams = args.cams or paths.list_cams(args.scene)
 
@@ -44,11 +51,16 @@ def main() -> int:
               f"--scene {args.scene} --threshold {best[1]} --w {best[2]}")
         return 0
 
-    res = matcher.run(args.scene, cams, threshold=args.threshold, w=args.w)
+    threshold = 2.0 if args.plates_only else args.threshold  # cosine <= 1: no appearance edges
+    res = matcher.run(args.scene, cams, threshold=threshold, w=args.w,
+                      only_groups=args.plates_only)
     print("matcher:", res)
     gid_map = {k: int(v) for k, v in
                __import__("json").loads((paths.OUTPUT_ROOT / args.scene / "global_ids.json").read_text()).items()}
-    print("IDF1:", evaluate_reid.idf1_real(args.scene, cams, gid_map))
+    try:
+        print("IDF1:", evaluate_reid.idf1_real(args.scene, cams, gid_map))
+    except FileNotFoundError:
+        print("IDF1: skipped (no ground truth for this scene)")
     return 0
 
 

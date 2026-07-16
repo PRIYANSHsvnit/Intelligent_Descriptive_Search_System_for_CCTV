@@ -211,6 +211,8 @@ The authoritative *what runs where* for the pipeline — exact IDs, device, and 
 | [6a] semantic | **SigLIP2** image encoder | `google/siglip2-so400m-patch14-224` | GPU fp16 | `semantic_vector` (1152) |
 | [6b] color name | **SigLIP2** text encoder (same model, zero-shot) | `google/siglip2-so400m-patch14-224` | GPU | `color` name (10-color vocab) |
 | [6c] appearance | **FastReID VeRi ResNet50-IBN (SBS)** — **profile-swappable** | `veri_sbs_R50-ibn.pth` → `veri_reid.onnx` (256×256 RGB) | **CPU** onnxruntime | `reid_appearance` (2048) |
+| [6d] person outfit color (persons only) | **SigLIP2** image+text encoder (same model, **region-split** zero-shot) | `google/siglip2-so400m-patch14-224` | GPU fp16 | `person_attrs.upper_color` / `.lower_color` (JSONB `{name,conf}`) |
+| [6e] person attributes / VLM (persons only) | **Qwen3-VL-4B-Instruct** (UD-Q6_K_XL GGUF) via **llama.cpp llama-server** — one multi-image request per tracklet (all K crops), JSON answer with "unknown" allowed, see note | `models/QWEN VLM/Qwen3-VL-4B-Instruct-UD-Q6_K_XL.gguf` + `mmproj-F16.gguf`; server `models/llama-cpp-cuda` (nix CUDA build; **`-c 2048` required on 6 GB**) | GPU (~4.7 GB, freed after the pass) | `person_attrs`: apparent_gender/age/backpack/headwear (JSONB `{name}`) + upper/lower_color fill-ins where SigLIP abstained (`{name, src:"vlm"}`) |
 | search (Path B) | **SigLIP2** text encoder (same model) | `google/siglip2-so400m-patch14-224` | **CPU** | query vector (1152) |
 
 **Notes that matter (reasoning, not repetition):**
@@ -308,6 +310,64 @@ Search query shape: `... WHERE entity_type='vehicle' [AND time range] ORDER BY s
 
 **Lock now (cheap now, migration later):** store **relative keys** in `crop_refs`/`video_ref` (e.g. `S01/c001/crops/t7_0.jpg`), never laptop-absolute paths like `/home/zer0/...`. The API resolves a key → the right URL, so switching tunnel ↔ object-store is a config change, not a DB rewrite.
 
+### Going live: recurring hourly ingest (DEFERRED — do NOT build for the demo)
+
+The schema above assumes scene-based one-shot ingest (run once per camera, done). Production
+use is different: police use it every day, footage arrives continuously, and we ingest it as
+an **offline batch every hour or so**. The columns barely change, but four things do — written
+down now so going live is a checklist, not a redesign. None of this is needed while ingest is
+one-shot per scene.
+
+1. **Batch-stamp `tracklet_id` (the one correctness item — MUST land with the first recurring
+   ingest).** Today `tracklet_id = {scene}_{cam}_t{tid}` where `tid` is the tracker's per-run
+   counter, which resets every run. Hour 2 therefore re-produces `SUR01_c001_t7`, and the
+   store stage's `ON CONFLICT DO UPDATE` upsert makes hour 2 **silently overwrite hour 1's
+   rows** (crop files under the same cam dir collide the same way). Fix: put the batch window
+   in the id and output paths, e.g. `SUR01_c001_2026071514_t7`. Bonus: re-running a *failed*
+   hour upserts the same ids — hourly ingest becomes naturally idempotent.
+
+2. **Wall time becomes the real query axis.** Police queries are wall-clock ("yesterday
+   14:00–16:00, camera X") and `ts_start_s` (seconds from scene start) stops meaning anything
+   when the "scene" runs forever. `wall_start/wall_end` flip from synthetic display clock to
+   real timestamps (batch start + in-clip offset); the backend filters on them instead of
+   `ts_*_s`. Rows arrive in time order, so a **BRIN index on `wall_start`** is nearly free and
+   ideal.
+
+3. **Partition `tracklets` by day.** The scale math makes this real, not hypothetical: the
+   c004 smoke test saw ~133 person tracklets in 30 s at a busy junction — with vehicles that's
+   ~25–30k tracklets/hour/camera at peak, plausibly **1–3M rows/day across 5 cams** (~13 KB of
+   vectors per row → tens of GB/day). Day partitions give: (a) **retention = `DROP PARTITION`**
+   (instant, no vacuum debt) — Indian CCTV practice is ~30–90 day retention, and the sweep must
+   also delete the crop/video files, which dwarf the DB; (b) a **local HNSW index per day**, so
+   index builds stay small; (c) time-scoped queries prune to 1–2 partitions, which also
+   neutralizes pgvector's filtered-ANN starvation (HNSW returns top-ef candidates *before* the
+   WHERE runs — a tight time filter over a global index starves; over a pruned partition it
+   doesn't). Note: the PK must then include the partition key (`wall_start`).
+
+4. **`ingest_batches` bookkeeping table** — what makes an unattended hourly job operable:
+
+   ```sql
+   CREATE TABLE ingest_batches (
+     camera_id  TEXT NOT NULL,
+     hour_start TIMESTAMPTZ NOT NULL,        -- the footage window this batch covers
+     file_path  TEXT,                        -- raw footage for this window (cold storage)
+     status     TEXT NOT NULL,               -- 'running' | 'done' | 'failed'
+     row_count  INT, error TEXT,
+     started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ,
+     PRIMARY KEY (camera_id, hour_start)
+   );
+   ```
+
+   The scheduler asks it what's done / what to retry; ops sees ingest lag at a glance.
+   `file_path` also makes this the pointer back to the raw footage of that window —
+   a batch row *is* the video segment, so no separate `video_segments` table is needed.
+
+Accepted trade-off: a tracklet straddling the hour cut is split in two. Search dedup already
+collapses same-camera same-subtype time-overlapping fragments, so we accept the split rather
+than engineer cross-batch track stitching. Optional when storage bites: `reid_appearance`
+(8.2 KB/row, only read by the offline cross-cam matcher) can move to `halfvec` or get a
+shorter retention than the searchable metadata.
+
 ---
 
 ## Implementation Detail — exact parameters (so nothing is ambiguous)
@@ -339,6 +399,13 @@ Search query shape: `... WHERE entity_type='vehicle' [AND time range] ORDER BY s
 > **Two things that matter for the number:** (1) **match FastReID's preprocessing** (vehicle models use ~256×256 input + its specific normalization) — get it wrong and embeddings degrade silently; (2) **measure on CityFlow crops, don't assume** — 97%-on-VeRi ≠ 97%-on-CityFlow (viewpoint/resolution domain gap); expect a large lift over the ~20% generic baseline, but let `evaluate_reid.py` tell you the real figure. DINOv2 stays only as an offline ablation — and being 384-dim it won't fit `reid_appearance vector(2048)`, so run ablations into a separate table/untyped array, not the production column. The chosen encoder fixes `reid_appearance` at **2048-dim** once — keep it.
 
 **[7] STORE.** Build the row, drop tracks with `num_detections < 2` (noise), upload crops to disk/object store, `INSERT ... ON CONFLICT (tracklet_id) DO UPDATE`.
+
+**Person attributes — outfit color (SigLIP) + structured attrs (VLM).** People are near-identical under coarse description ("man, blue shirt, jeans"), so the SigLIP vector *alone* over-returns on person queries. The fix is **not more attributes — it's putting each attribute in the right role:**
+- **Hard filters (reliable → safe to gate on):** `scene`, `camera_id`, the **time window** (`ts_*_s`), `entity_type`, `subtype`. These cut the vast majority of false positives at ~zero risk and are already indexed (`tracklets_filter`); almost every real query is scoped in space + time, which is the actual lever for "too many results", not richer attributes.
+- **Soft ranking signals (brittle → NEVER a hard filter; always abstain when unsure):** everything person-specific. ANDing brittle attributes multiplies their error into recall (three 85%-accurate filters ≈ 61% chance of dropping the true match). SigLIP already does the soft-OR fusion, so attributes only **re-rank its top-K, confidence-weighted** — an absent or abstained attribute contributes 0, never a penalty.
+- **What we store** (`person_attrs` JSONB, additive/nullable — no migration): **upper- and lower-body color** — the region-split SigLIP zero-shot stage (see [6d]) — plus a **VLM pass** (Qwen3-VL-4B via llama.cpp, see [6e]) adding apparent_gender/age/backpack/headwear. **Why a VLM and not a supervised PAR classifier:** we tried one (PromptPAR, PETA-35 and PA100K checkpoints) and both failed on Surat with **high-confidence false positives** — the root cause is structural: a closed-set classifier under domain shift is *forced to answer* and is miscalibrated, so its wrong answers come at 0.95+. The VLM fixes that structurally — **"unknown" is an allowed answer**, so unreadable crops abstain instead of mislabeling (validated on SUR01/c004: correct female+headscarf and elderly reads, backpack from strap detail, all-"unknown" on a 41×77 blob; ~1.4 s/tracklet). **Multi-image per tracklet:** all K crops go in one request with a prompt stating they show the same tracked person — this rejects bystanders (a single-crop run absorbed a helmeted scooter rider behind the subject into "helmet") and combines views (backpack only visible from behind). **Schema pruned to what the footage supports:** footwear and fine age bands dropped (unreadable at CCTV resolution); age is child/adult/elderly; headwear vocab is India-appropriate (cap/helmet/turban/scarf). Attribute quality is **unscored until a hand-labeled eval set (~100 tracklets) exists** — until then everything VLM-derived stays a soft ranking signal, gender doubly so (*presentation, never identity*). Fine-tuning is the last resort, via VLM pseudo-labels, only if throughput ever demands a dedicated model. **Faces are out of scope** (low-res, privacy, not needed).
+- **Region-split color, why:** one dominant color blends shirt + trousers into mush. Naming an **upper** region (torso, y≈.15–.50) and a **lower** region (legs, y≈.50–.85) independently against clothing-noun prompts (`"a red shirt"`, `"blue trousers"`) yields two independent signals — the single biggest discriminator for people — and is nearly free (reuses the SigLIP image + text towers). Each region gets `{name, conf}`; low top1-top2 margin abstains.
+- **Recall > precision for CCTV investigation:** better the target sits at rank 12 in a slightly noisy list than a clean list that filtered them out via a misclassified attribute. So Tier-B stays strictly soft; any *hard* attribute filter is opt-in (an explicit UI checkbox) and only ever on the Tier-A-reliable fields.
 
 **Geometry / space-time gate (only when calibration + sync exist).** To place a tracklet in the real world: take the box's **bottom-center** (the wheels-on-road point the homography is accurate about), and apply the **inverse** homography `H⁻¹`. CityFlow's `calibration.txt` stores the matrix **ground→image**, so applying it directly to pixels gives garbage; `H⁻¹` maps image→ground (GPS lat/lon). Convert lat/lon to **local meters** before any distance test (degrees are anisotropic — at ~42.5°N, 1° lat ≈ 111 km, 1° lon ≈ 82 km). Camera **c005** also carries camera intrinsics + lens-distortion coefficients — undistort its points before `H⁻¹`, and tolerate the extra lines when parsing. Keep gates **generous** (tens of meters; homography degrades near the horizon and reprojection errors run ~3–11 px). Payoff: once inverted, all of a scene's cameras land in **one shared GPS frame automatically** — no manual cross-camera alignment. Store the result in `ground_x`/`ground_y` (meters). **Using it:** this scene's cameras *overlap*, so treat space-time as a positive **trajectory-consistency** cue, not an exit→entrance veto — at overlapping timestamps require the two projected positions to agree (~15–30 m); at non-overlapping times require a plausible implied speed (≤ ~40 m/s). No hand-built topology table needed.
 

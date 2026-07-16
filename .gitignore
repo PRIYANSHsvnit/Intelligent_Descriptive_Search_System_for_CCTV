@@ -68,3 +68,4 @@ VeRi/
 
 # throwaway detection sanity output
 apps/ingest/sanity_out*
+apps/ingest/*.log

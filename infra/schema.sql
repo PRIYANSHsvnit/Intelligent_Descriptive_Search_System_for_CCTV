@@ -7,6 +7,7 @@
 -- global_id later is UPDATE/append work, never a migration-and-rebuild.
 
 CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;   -- fuzzy plate search (trigram GIN indexes)
 
 CREATE TABLE IF NOT EXISTS tracklets (
   tracklet_id     TEXT PRIMARY KEY,           -- e.g. 'S01_c001_t7'
@@ -16,6 +17,7 @@ CREATE TABLE IF NOT EXISTS tracklets (
   entity_type     TEXT NOT NULL,              -- 'vehicle' | 'person'
   subtype         TEXT,                       -- 'car','truck','bus','motorcycle','bicycle','person'
   color           TEXT,                       -- dominant color name (Phase 1); RANKING signal only, never a hard filter
+  color_conf      REAL,                       -- SigLIP zero-shot confidence for `color`; lets ranking demote unsure colors
   -- when (global scene clock)
   frame_start     INT,  frame_end   INT,
   ts_start_s      REAL, ts_end_s    REAL,     -- seconds from scene start
@@ -32,8 +34,34 @@ CREATE TABLE IF NOT EXISTS tracklets (
   reid_color      vector(56),                -- HSV color signature; fused at match time  Phase 1
   -- cross-camera + later work (nullable = additive)
   global_id       INT,                        -- Phase 3; scene-namespaced (don't collide S01#42 with S02#42)
-  plate_text      TEXT, plate_conf REAL,      -- Phase 5 (bonus)
+  -- plates, two tiers (see pipeline/plate.py): plate_text = validated ASSERTION
+  -- (constraint stack + voting, NULL = abstain); plate_raw = best raw OCR read,
+  -- RECALL tier — never displayed as fact, only searched fuzzily.
+  plate_text      TEXT, plate_conf REAL,
+  plate_raw       TEXT,
   person_attrs    JSONB                       -- Phase 5 (outfit colors, hat, bag...)
+);
+
+-- Dimension tables: where cameras physically are. Replaces footage_data/cam_labels/*.json
+-- as the source of truth for display names once populated (backend can fall back to the
+-- JSON until then). Camera ids are scene-scoped ('c001' exists in both S01 and SUR01),
+-- so the camera key is (scene, camera_id) — same pair tracklets already carries. No FK
+-- from tracklets: ingest must never fail because a camera row wasn't registered yet.
+CREATE TABLE IF NOT EXISTS locations (
+  location_id  TEXT PRIMARY KEY,             -- e.g. 'SUR01_athwa_gate'
+  name         TEXT NOT NULL,                -- "Athwa Gate Junction"
+  geo_lat      DOUBLE PRECISION,             -- junction point for the trace-map UI
+  geo_long     DOUBLE PRECISION,
+  site_group   TEXT                          -- optional zone/precinct grouping
+);
+
+CREATE TABLE IF NOT EXISTS cameras (
+  scene        TEXT NOT NULL,                -- 'SUR01'
+  camera_id    TEXT NOT NULL,                -- 'c001'
+  location_id  TEXT REFERENCES locations(location_id),
+  label        TEXT,                         -- human-readable: "Athwa Gate, facing north"
+  is_active    BOOLEAN DEFAULT TRUE,
+  PRIMARY KEY (scene, camera_id)
 );
 
 -- Vector index on the SEARCH vector only (cosine HNSW). Optional at a few-thousand
@@ -44,3 +72,13 @@ CREATE INDEX IF NOT EXISTS tracklets_semantic_hnsw
   ON tracklets USING hnsw (semantic_vector vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS tracklets_filter
   ON tracklets (scene, camera_id, entity_type, color);
+
+-- Additive column for DBs created before the plate stage (CREATE TABLE IF NOT
+-- EXISTS won't add it); harmless no-op on fresh DBs.
+ALTER TABLE tracklets ADD COLUMN IF NOT EXISTS plate_raw TEXT;
+
+-- Trigram indexes for the layered plate search (exact -> substring -> similarity).
+CREATE INDEX IF NOT EXISTS tracklets_plate_trgm
+  ON tracklets USING gin (plate_text gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS tracklets_plate_raw_trgm
+  ON tracklets USING gin (plate_raw gin_trgm_ops);
