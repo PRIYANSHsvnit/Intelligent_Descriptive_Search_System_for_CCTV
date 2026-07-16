@@ -150,6 +150,58 @@
   color: #7a8090;
   font-variant-numeric: tabular-nums;
 }
+.attrs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 0 12px 12px;
+}
+.attr {
+  font-size: 11px;
+  line-height: 1;
+  padding: 4px 7px;
+  border-radius: 999px;
+  background: #1f2633;
+  color: #b7c0d0;
+  text-transform: capitalize;
+}
+
+.plateRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px 12px;
+}
+.plate {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 3px 8px;
+  border-radius: 4px;
+  background: #2a2410;
+  color: #e8c765;
+  border: 1px solid #4a3f1c;
+}
+.plateConf {
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 400;
+  letter-spacing: 0;
+  color: #9a8c55;
+}
+.matchTag {
+  font-size: 11px;
+  line-height: 1;
+  padding: 4px 7px;
+  border-radius: 999px;
+  background: #1f2633;
+  color: #8fa3c4;
+}
 
 .overlay {
   position: fixed;

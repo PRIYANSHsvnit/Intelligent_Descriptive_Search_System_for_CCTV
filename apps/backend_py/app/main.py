@@ -2,6 +2,7 @@
 
 Endpoints (see plan.md API contract):
   GET /search?q=&type=&scene=&t0=&t1=&limit=  -> ranked, de-duplicated tracklets
+  GET /search?plate=&scene=&limit=            -> layered plate lookup (exact/partial/fuzzy)
   GET /media/{scene}/{camera}                 -> per-camera H.264/MP4 (HTTP range)
   GET /trace/{scene}/{global_id}              -> cross-camera hops (Phase 3 data)
   /files/<crop_ref>                           -> crop thumbnails (static)
@@ -47,13 +48,19 @@ def health():
 
 @app.get("/search")
 def search(
-    q: str = Query(..., min_length=1),
+    q: str | None = Query(None, min_length=1),
+    plate: str | None = Query(None, min_length=2, max_length=16,
+                              description="registration query, full or partial (e.g. 'GJ05AY1139' or '1139')"),
     type: str | None = Query(None, pattern="^(vehicle|person)$"),
     scene: str | None = None,
     t0: float | None = None,
     t1: float | None = None,
     limit: int = Query(20, ge=1, le=100),
 ):
+    if plate:
+        return engine.search_plate(plate, scene, limit)
+    if not q:
+        raise HTTPException(422, "provide q (description) or plate")
     return engine.search(q, type, scene, t0, t1, limit)
 
 

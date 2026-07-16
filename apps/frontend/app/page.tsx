@@ -18,9 +18,23 @@ type Result = {
   crop_url: string | null;
   video_url: string | null;
   global_id: number | null;
+  attrs?: string[];
+  plate?: string | null;
+  plate_conf?: number | null;
+  matched_on?: "exact" | "partial" | "fuzzy";
 };
 
-const EXAMPLES = ["white truck", "dark sedan", "silver car", "red car"];
+const EXAMPLES = [
+  "man wearing a cap",
+  "person in a blue shirt",
+  "woman in a red saree",
+  "man with a backpack",
+  "motorcycle",
+  "auto rickshaw",
+];
+
+// registration queries: full plate or any fragment (last-4 digits is the realistic case)
+const PLATE_EXAMPLES = ["GJ05JP4237", "GJ05CU6121", "GJ18Z8995", "4237", "GJ08"];
 
 // Hand-annotated camera pixel positions (normalized 0..1) on cam_loc/<scene>.png.
 const CAM_POS: Record<string, Record<string, [number, number]>> = {
@@ -44,9 +58,10 @@ type Hop = {
 };
 
 export default function Home() {
-  const [q, setQ] = useState("white truck");
+  const [q, setQ] = useState("man wearing a cap");
+  const [mode, setMode] = useState<"desc" | "plate">("desc");
   const [type, setType] = useState("");
-  const [scene, setScene] = useState("S01");
+  const [scene, setScene] = useState("SUR01");
   const [results, setResults] = useState<Result[]>([]);
   const [fellBack, setFellBack] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -60,8 +75,13 @@ export default function Home() {
       setLoading(true);
       setSearched(true);
       try {
-        const p = new URLSearchParams({ q: query, limit: "24" });
-        if (type) p.set("type", type);
+        const p = new URLSearchParams({ limit: "24" });
+        if (mode === "plate") {
+          p.set("plate", query);
+        } else {
+          p.set("q", query);
+          if (type) p.set("type", type);
+        }
         if (scene) p.set("scene", scene);
         const r = await fetch(`${API}/search?${p}`);
         const data = await r.json();
@@ -73,12 +93,12 @@ export default function Home() {
         setLoading(false);
       }
     },
-    [type, scene],
+    [mode, type, scene],
   );
 
   // run the default query once on mount; support ?trace=<gid> deep-link to a path
   useEffect(() => {
-    runSearch("white truck");
+    runSearch("man wearing a cap");
     const g = new URLSearchParams(window.location.search).get("trace");
     if (g) setTraceGid(Number(g));
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -100,19 +120,30 @@ export default function Home() {
           runSearch(q);
         }}
       >
+        <select
+          className={styles.select}
+          value={mode}
+          onChange={(e) => setMode(e.target.value as "desc" | "plate")}
+        >
+          <option value="desc">describe</option>
+          <option value="plate">plate no.</option>
+        </select>
         <input
           className={styles.input}
           value={q}
           onChange={(e) => setQ(e.target.value)}
-          placeholder="e.g. white pickup truck"
+          placeholder={mode === "plate" ? "e.g. GJ05JP4237 or just 4237" : "e.g. white pickup truck"}
         />
-        <select className={styles.select} value={type} onChange={(e) => setType(e.target.value)}>
-          <option value="">any type</option>
-          <option value="vehicle">vehicle</option>
-          <option value="person">person</option>
-        </select>
+        {mode === "desc" && (
+          <select className={styles.select} value={type} onChange={(e) => setType(e.target.value)}>
+            <option value="">any type</option>
+            <option value="vehicle">vehicle</option>
+            <option value="person">person</option>
+          </select>
+        )}
         <select className={styles.select} value={scene} onChange={(e) => setScene(e.target.value)}>
           <option value="">all scenes</option>
+          <option value="SUR01">Surat (SUR01)</option>
           <option value="S01">S01</option>
         </select>
         <button className={styles.button} type="submit">
@@ -121,7 +152,7 @@ export default function Home() {
       </form>
 
       <div className={styles.examples}>
-        {EXAMPLES.map((ex) => (
+        {(mode === "plate" ? PLATE_EXAMPLES : EXAMPLES).map((ex) => (
           <button
             key={ex}
             className={styles.chip}
@@ -163,6 +194,32 @@ export default function Home() {
             <div className={styles.metaSub}>
               {r.camera_label ?? r.camera_id} · {r.ts_start_s.toFixed(1)}–{r.ts_end_s.toFixed(1)}s
             </div>
+            {(r.plate || r.matched_on) && (
+              <div className={styles.plateRow}>
+                {r.plate && (
+                  <span className={styles.plate}>
+                    {r.plate}
+                    <span className={styles.plateConf}>
+                      {(r.plate_conf ?? 0) >= 0.8 ? "confirmed" : "probable"}
+                    </span>
+                  </span>
+                )}
+                {r.matched_on && r.matched_on !== "exact" && (
+                  <span className={styles.matchTag}>
+                    {r.matched_on === "partial" ? "partial match" : "fuzzy match — verify in clip"}
+                  </span>
+                )}
+              </div>
+            )}
+            {r.attrs && r.attrs.length > 0 && (
+              <div className={styles.attrs}>
+                {r.attrs.map((a) => (
+                  <span key={a} className={styles.attr}>
+                    {a}
+                  </span>
+                ))}
+              </div>
+            )}
           </button>
         ))}
       </div>
@@ -196,7 +253,8 @@ function Player({ result, onClose }: { result: Result; onClose: () => void }) {
           <strong>{result.tracklet_id}</strong>
           <span>
             {result.subtype}
-            {result.color ? ` · ${result.color}` : ""} · {result.camera_label ?? result.camera_id} ·{" "}
+            {result.color ? ` · ${result.color}` : ""}
+            {result.plate ? ` · ${result.plate}` : ""} · {result.camera_label ?? result.camera_id} ·{" "}
             {result.ts_start_s.toFixed(1)}–{result.ts_end_s.toFixed(1)}s
           </span>
           <button className={styles.close} onClick={onClose}>

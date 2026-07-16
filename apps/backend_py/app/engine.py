@@ -3,6 +3,8 @@ dedup, and fail-open behavior. See plan.md Path B and the API contract."""
 
 from __future__ import annotations
 
+import re
+
 import numpy as np
 import psycopg
 import torch
@@ -45,7 +47,8 @@ def _connect() -> psycopg.Connection:
 
 _SELECT = """
     SELECT tracklet_id, scene, camera_id, subtype, color, entity_type,
-           ts_start_s, ts_end_s, crop_refs, video_ref, global_id,
+           ts_start_s, ts_end_s, crop_refs, video_ref, global_id, person_attrs,
+           plate_text, plate_conf,
            1 - (semantic_vector <=> %(q)s) AS score
     FROM tracklets
     WHERE {where}
@@ -108,6 +111,94 @@ def _crop_url(row: dict) -> str | None:
     return f"/files/{refs[0]}" if refs else None
 
 
+def _attr_tags(pa: dict | None) -> list[str]:
+    """Compact human-readable chips from the VLM/SigLIP person_attrs JSONB.
+    Skips 'unknown'/'none'/'no' so only committed attributes show."""
+    if not pa:
+        return []
+
+    def name(key: str) -> str | None:
+        v = pa.get(key)
+        n = v.get("name") if isinstance(v, dict) else None
+        return n if n and n not in ("unknown", "none", "no") else None
+
+    tags: list[str] = []
+    for key in ("apparent_gender", "age"):
+        if n := name(key):
+            tags.append(n)
+    if n := name("headwear"):
+        tags.append(n)
+    if name("backpack") == "yes":
+        tags.append("backpack")
+    if n := name("upper_color"):
+        tags.append(f"{n} top")
+    if n := name("lower_color"):
+        tags.append(f"{n} bottom")
+    return tags
+
+
+_PLATE_SELECT = """
+    SELECT tracklet_id, scene, camera_id, subtype, color, entity_type,
+           ts_start_s, ts_end_s, crop_refs, video_ref, global_id, person_attrs,
+           plate_text, plate_conf, plate_raw,
+           COALESCE(plate_text = %(p)s, false) AS exact,
+           COALESCE(plate_text ILIKE %(pat)s, false)
+             OR COALESCE(plate_raw ILIKE %(pat)s, false) AS substr,
+           GREATEST(COALESCE(similarity(plate_text, %(p)s), 0),
+                    COALESCE(similarity(plate_raw, %(p)s), 0)) AS sim
+    FROM tracklets
+    WHERE (plate_text IS NOT NULL OR plate_raw IS NOT NULL) {extra}
+      AND (plate_text = %(p)s
+           OR plate_text ILIKE %(pat)s OR plate_raw ILIKE %(pat)s
+           OR similarity(plate_text, %(p)s) > %(minsim)s
+           OR similarity(plate_raw, %(p)s) > %(minsim)s)
+    ORDER BY exact DESC, substr DESC, (plate_text IS NOT NULL) DESC, sim DESC
+    LIMIT %(lim)s
+"""
+
+
+def search_plate(plate_query, scene, limit, min_sim=0.30):
+    """Layered plate lookup, tiered so retrieval never over-claims:
+    exact on the validated plate first, then substring on both tiers (partial
+    queries like '1139'), then trigram similarity (catches raw reads such as
+    'JO5AY1139' for the query 'GJ05AY1139'). Results carry matched_on so the UI
+    can present fuzzy hits as candidates to verify, not identifications."""
+    p = re.sub(r"[^A-Z0-9]", "", plate_query.upper())
+    if not p:
+        return {"results": [], "fell_back": False}
+    params = {"p": p, "pat": f"%{p}%", "minsim": min_sim, "lim": limit}
+    extra = ""
+    if scene:
+        extra = "AND scene = %(scene)s"
+        params["scene"] = scene
+    with _connect() as conn, conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+        cur.execute(_PLATE_SELECT.format(extra=extra), params)
+        rows = cur.fetchall()
+    results = [
+        {
+            "tracklet_id": r["tracklet_id"],
+            "scene": r["scene"],
+            "camera_id": r["camera_id"],
+            "camera_label": config.camera_label(r["scene"], r["camera_id"]),
+            "subtype": r["subtype"],
+            "color": r["color"],
+            "ts_start_s": round(r["ts_start_s"], 2),
+            "ts_end_s": round(r["ts_end_s"], 2),
+            "score": round(float(r["sim"]), 4),
+            "crop_url": _crop_url(r),
+            "video_url": f"/media/{r['scene']}/{r['camera_id']}" if r["video_ref"] else None,
+            "global_id": r["global_id"],
+            "attrs": _attr_tags(r.get("person_attrs")),
+            "plate": r["plate_text"],
+            "plate_conf": r["plate_conf"],
+            "matched_on": ("exact" if r["exact"] else
+                           "partial" if r["substr"] else "fuzzy"),
+        }
+        for r in rows
+    ]
+    return {"results": results, "fell_back": False}
+
+
 def search(query, entity_type, scene, t0, t1, limit):
     qvec = encode_text(query)
     fetch = max(limit * 4, 40)  # over-fetch so dedup still returns ~limit
@@ -134,6 +225,9 @@ def search(query, entity_type, scene, t0, t1, limit):
             "crop_url": _crop_url(r),
             "video_url": f"/media/{r['scene']}/{r['camera_id']}" if r["video_ref"] else None,
             "global_id": r["global_id"],
+            "attrs": _attr_tags(r.get("person_attrs")),
+            "plate": r.get("plate_text"),
+            "plate_conf": r.get("plate_conf"),
         }
         for r in rows
     ]

@@ -20,6 +20,7 @@ _COLS = [
     "frame_start", "frame_end", "ts_start_s", "ts_end_s", "wall_start", "wall_end",
     "num_detections", "avg_conf", "crop_refs", "video_ref",
     "semantic_vector", "reid_appearance", "reid_color", "person_attrs",
+    "plate_text", "plate_conf", "plate_raw",
 ]
 _UPDATE = ", ".join(f"{c}=EXCLUDED.{c}" for c in _COLS if c != "tracklet_id")
 _SQL = (
@@ -65,6 +66,7 @@ def run(scene: str, cam: str, min_detections: int = 2) -> dict:
             reid_app[i] if reid_app is not None else None,
             reid_color[i] if reid_color is not None else None,
             Jsonb(t["person_attrs"]) if t.get("person_attrs") else None,
+            t.get("plate_text"), t.get("plate_conf"), t.get("plate_raw"),
         ))
 
     with connect() as conn, conn.cursor() as cur:
