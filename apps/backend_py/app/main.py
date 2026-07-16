@@ -6,6 +6,7 @@ Endpoints (see plan.md API contract):
   POST /search/image (multipart)              -> reference-image search (SigLIP image tower)
   GET /search/similar?tracklet_id=&vec=       -> more-like-this from a stored tracklet
   GET /media/{scene}/{camera}                 -> per-camera H.264/MP4 (HTTP range)
+  GET /tracklets/{tracklet_id}/boxes          -> per-frame boxes for the player overlay
   GET /trace/{scene}/{global_id}              -> cross-camera hops (Phase 3 data)
   /files/<crop_ref>                           -> crop thumbnails (static)
 
@@ -19,11 +20,11 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
-from . import config, engine
+from . import boxes, config, engine
 
 
 @asynccontextmanager
@@ -108,6 +109,15 @@ def media(scene: str, camera: str):
     if not path.exists():
         raise HTTPException(404, f"no media for {scene}/{camera}")
     return FileResponse(str(path), media_type="video/mp4")  # starlette handles Range
+
+
+@app.get("/tracklets/{tracklet_id}/boxes")
+def tracklet_boxes(tracklet_id: str):
+    out = boxes.tracklet_boxes(tracklet_id)
+    if out is None:
+        raise HTTPException(404, f"no boxes for {tracklet_id}")
+    # detections.npy is immutable per ingest run — let the browser keep it 6h
+    return JSONResponse(out, headers={"Cache-Control": "public, max-age=21600"})
 
 
 @app.get("/trace/{scene}/{global_id}")

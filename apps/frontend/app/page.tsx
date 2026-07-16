@@ -376,6 +376,27 @@ export default function Home() {
   );
 }
 
+// per-frame box timeline from /tracklets/{id}/boxes: [video-local s, x1,y1,x2,y2]
+// in source-video pixels (media is never rescaled, so videoWidth/Height match)
+type BoxRow = [number, number, number, number, number];
+
+// largest i with boxes[i].t <= t (binary search; -1 if t precedes the track)
+function boxIndexAt(boxes: BoxRow[], t: number): number {
+  let lo = 0,
+    hi = boxes.length - 1,
+    ans = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (boxes[mid]![0] <= t) {
+      ans = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return ans;
+}
+
 function Player({
   result,
   onClose,
@@ -386,11 +407,68 @@ function Player({
   onSimilar: (r: Result, vec: "semantic" | "reid") => void;
 }) {
   const ref = useRef<HTMLVideoElement>(null);
+  const boxRef = useRef<SVGRectElement>(null);
+  const [boxes, setBoxes] = useState<BoxRow[] | null>(null);
   const src = result.video_url ? `${API}${result.video_url}` : null;
   // seek in video-file time (scene-clock minus camera offset); older rows without it
   // fall back to the scene timestamps (S01, where offsets are ~0)
   const seek0 = result.video_start_s ?? result.ts_start_s;
   const seek1 = result.video_end_s ?? result.ts_end_s;
+
+  useEffect(() => {
+    let ok = true;
+    setBoxes(null);
+    fetch(`${API}/tracklets/${result.tracklet_id}/boxes`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => ok && setBoxes(d?.boxes ?? null))
+      .catch(() => ok && setBoxes(null)); // overlay is best-effort; video still plays
+    return () => {
+      ok = false;
+    };
+  }, [result.tracklet_id]);
+
+  // follow the object: every animation frame, place the rect for currentTime
+  // (timeupdate alone fires ~4 Hz and would lag the video)
+  useEffect(() => {
+    if (!boxes || boxes.length === 0) return;
+    let raf = 0;
+    const tick = () => {
+      raf = requestAnimationFrame(tick);
+      const v = ref.current;
+      const rect = boxRef.current;
+      if (!v || !rect || !v.videoWidth) return;
+      const t = v.currentTime;
+      const i = boxIndexAt(boxes, t);
+      const cur = i >= 0 ? boxes[i] : undefined;
+      // hide before the track starts, after it ends, or across detection gaps
+      const GAP = 0.5;
+      if (!cur || t - cur[0] > GAP) {
+        rect.setAttribute("visibility", "hidden");
+        return;
+      }
+      let [t0, x1, y1, x2, y2] = cur;
+      const nxt = boxes[i + 1];
+      if (nxt && nxt[0] > t0 && nxt[0] - t0 <= GAP) {
+        const a = (t - t0) / (nxt[0] - t0);
+        x1 += (nxt[1] - x1) * a;
+        y1 += (nxt[2] - y1) * a;
+        x2 += (nxt[3] - x2) * a;
+        y2 += (nxt[4] - y2) * a;
+      }
+      // map source pixels -> element pixels through the video's contain-fit
+      // (max-height can pillarbox the content inside the element box)
+      const scale = Math.min(v.clientWidth / v.videoWidth, v.clientHeight / v.videoHeight);
+      const ox = (v.clientWidth - v.videoWidth * scale) / 2;
+      const oy = (v.clientHeight - v.videoHeight * scale) / 2;
+      rect.setAttribute("x", String(ox + x1 * scale));
+      rect.setAttribute("y", String(oy + y1 * scale));
+      rect.setAttribute("width", String(Math.max(0, (x2 - x1) * scale)));
+      rect.setAttribute("height", String(Math.max(0, (y2 - y1) * scale)));
+      rect.setAttribute("visibility", "visible");
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [boxes]);
 
   return (
     <div className={styles.overlay} onClick={onClose}>
@@ -423,22 +501,29 @@ function Player({
           </button>
         </div>
         {src ? (
-          <video
-            ref={ref}
-            className={styles.video}
-            src={src}
-            controls
-            autoPlay
-            onLoadedMetadata={() => {
-              if (ref.current) ref.current.currentTime = seek0;
-            }}
-            onTimeUpdate={() => {
-              const v = ref.current;
-              if (v && v.currentTime >= seek1) {
-                v.currentTime = seek0; // loop the object's window
-              }
-            }}
-          />
+          <div className={styles.videoWrap}>
+            <video
+              ref={ref}
+              className={styles.video}
+              src={src}
+              controls
+              autoPlay
+              onLoadedMetadata={() => {
+                if (ref.current) ref.current.currentTime = seek0;
+              }}
+              onTimeUpdate={() => {
+                const v = ref.current;
+                if (v && v.currentTime >= seek1) {
+                  v.currentTime = seek0; // loop the object's window
+                }
+              }}
+            />
+            {boxes && boxes.length > 0 && (
+              <svg className={styles.boxSvg}>
+                <rect ref={boxRef} className={styles.boxRect} visibility="hidden" rx={3} />
+              </svg>
+            )}
+          </div>
         ) : (
           <div className={styles.status}>No video for this tracklet.</div>
         )}
