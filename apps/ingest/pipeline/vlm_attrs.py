@@ -22,8 +22,14 @@ only, never a hard filter (gender/age especially — unscored until the eval set
 Runs llama-server (nix CUDA build, models/llama-cpp-cuda) as a child process, started
 lazily on the first cam and kept for the whole stage pass; run_ingest calls shutdown()
 after the pass so the ~4.7 GB of VRAM is freed before the next GPU stage. llama.cpp is
-not torch — no gpu_setup shim needed. -c 2048 is REQUIRED on the 6 GB 4050 (the default
-context OOMs). Skips gracefully if the binary or GGUFs are missing.
+not torch — no gpu_setup shim needed. Skips gracefully if the binary or GGUFs are missing.
+
+Throughput: the server runs VLM_PARALLEL continuous-batching slots and this stage fires
+that many requests concurrently. On the 6 GB 4050, serial was ~1.3 s/tracklet; 4 slots +
+q8_0 KV cache gives ~0.39 s/tracklet (~3.3x, plateaus at 4 — the card's compute ceiling).
+KV must be quantized (-ctk/-ctv q8_0): 4 slots x 2048 ctx in f16 OOMs the 6 GB card; q8
+halves the KV footprint so it fits (measured ~5.7/6.1 GB). Per-slot ctx must still hold
+K_CROPS images + prompt, so total -c = VLM_CTX_PER_SLOT * VLM_PARALLEL.
 """
 
 from __future__ import annotations
@@ -36,6 +42,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 from . import paths
 
@@ -47,10 +54,15 @@ VLM_GGUF = os.environ.get(
     "VLM_GGUF", str(_MODELS / "QWEN VLM" / "Qwen3-VL-4B-Instruct-UD-Q6_K_XL.gguf"))
 VLM_MMPROJ = os.environ.get("VLM_MMPROJ", str(_MODELS / "QWEN VLM" / "mmproj-F16.gguf"))
 VLM_PORT = int(os.environ.get("VLM_PORT", "8090"))
-VLM_CTX = 2048                 # fits K_CROPS images + prompt; default ctx OOMs 6 GB VRAM
+VLM_PARALLEL = int(os.environ.get("VLM_PARALLEL", "4"))   # concurrent slots; 4 saturates the 4050
+VLM_CTX_PER_SLOT = 2048        # per slot: fits K_CROPS images + prompt (default ctx OOMs 6 GB)
+VLM_CTX = VLM_CTX_PER_SLOT * VLM_PARALLEL   # llama.cpp splits total -c across the -np slots
 VLM_MAX_TOKENS = 120
 VLM_LOAD_TIMEOUT_S = 180       # model load + warmup before /health goes ok
 VLM_REQUEST_TIMEOUT_S = 120
+# A/B eval only: if set to a dir, dump per-cam SigLIP(stage6)-vs-VLM raw colors side by side
+# for the same person tracklets in this one pass (no effect on the production merge below).
+VLM_AB_DUMP = os.environ.get("VLM_AB_DUMP")
 
 _URL = f"http://127.0.0.1:{VLM_PORT}/v1/chat/completions"
 _HEALTH = f"http://127.0.0.1:{VLM_PORT}/health"
@@ -104,7 +116,9 @@ def _ensure_server() -> str | None:
     log = open(paths.OUTPUT_ROOT / "vlm_server.log", "ab")  # noqa: SIM115 - outlives scope
     _proc = subprocess.Popen(
         [VLM_SERVER_BIN, "-m", VLM_GGUF, "--mmproj", VLM_MMPROJ,
-         "-ngl", "99", "-c", str(VLM_CTX), "--host", "127.0.0.1", "--port", str(VLM_PORT)],
+         "-ngl", "99", "-c", str(VLM_CTX), "-np", str(VLM_PARALLEL), "-cb",
+         "-ctk", "q8_0", "-ctv", "q8_0",      # q8 KV: 4 slots x 2048 in f16 OOMs 6 GB
+         "--host", "127.0.0.1", "--port", str(VLM_PORT)],
         stdout=log, stderr=log)
     atexit.register(shutdown)
     deadline = time.time() + VLM_LOAD_TIMEOUT_S
@@ -170,17 +184,33 @@ def run(scene: str, cam: str) -> dict:
 
     t0 = time.time()
     labeled = failures = color_fills = 0
-    for i, t in persons:
-        crops = [str(paths.OUTPUT_ROOT / k) for k in t["crop_refs"]
-                 if (paths.OUTPUT_ROOT / k).exists()]
-        if not crops:
-            continue
-        ans = _ask(crops)
+
+    # Resolve each person's crops up front, then fan the requests out across the server's
+    # VLM_PARALLEL slots. _ask is pure/thread-safe; the merge below stays single-threaded so
+    # the tracklets/counter mutations never race.
+    work = [(i, crops) for i, t in persons
+            if (crops := [str(paths.OUTPUT_ROOT / k) for k in t["crop_refs"]
+                          if (paths.OUTPUT_ROOT / k).exists()])]
+    with ThreadPoolExecutor(max_workers=VLM_PARALLEL) as ex:
+        answers = list(ex.map(lambda w: (w[0], _ask(w[1])), work))
+
+    ab_rows = []                               # A/B eval only (VLM_AB_DUMP)
+    for i, ans in answers:
+        sig = tracklets[i].get("person_attrs") or {}   # SigLIP region colors (stage 6), pre-merge
+        if VLM_AB_DUMP:
+            ab_rows.append({
+                "tracklet_id": tracklets[i]["tracklet_id"],
+                "cam": cam, "num_detections": tracklets[i]["num_detections"],
+                "crop_refs": tracklets[i]["crop_refs"],
+                "siglip_upper": sig.get("upper_color"), "siglip_lower": sig.get("lower_color"),
+                "vlm_upper": None if ans is None else str(ans.get("upper_color", "")).strip().lower() or None,
+                "vlm_lower": None if ans is None else str(ans.get("lower_color", "")).strip().lower() or None,
+                "vlm_failed": ans is None,
+            })
         if ans is None:
             failures += 1
             continue
-        attrs = {k: v for k, v in (t.get("person_attrs") or {}).items()
-                 if k not in _OWNED_KEYS}
+        attrs = {k: v for k, v in sig.items() if k not in _OWNED_KEYS}
         wrote = False
         for vk, sk in _ATTR_KEYS.items():
             name = str(ans.get(vk, "unknown")).strip().lower()
@@ -198,6 +228,10 @@ def run(scene: str, cam: str) -> dict:
             labeled += 1
 
     (out / "tracklets.json").write_text(json.dumps(tracklets, indent=2))
+    if VLM_AB_DUMP:
+        os.makedirs(VLM_AB_DUMP, exist_ok=True)
+        with open(os.path.join(VLM_AB_DUMP, f"{scene}_{cam}_abcolors.json"), "w") as f:
+            json.dump(ab_rows, f, indent=2)
     return {"cam": cam, "persons": len(persons), "labeled": labeled,
             "color_fills": color_fills, "failures": failures,
             "secs": round(time.time() - t0, 1)}
