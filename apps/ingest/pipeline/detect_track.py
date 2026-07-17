@@ -1,9 +1,14 @@
 """Stages 1-4: DECODE (full fps) → DETECT (YOLO11m) → TRACK (BoT-SORT) → CROP (K best).
 
-Runs on GPU. Persists, per camera:
-  - detections.npy : every per-frame box (for the evaluator's IoU→GT match, full fps)
+Runs on GPU. ONE decode pass: each frame is read once and handed to both detectors
+(vehicle + optional person), each keeping its own persistent BoT-SORT state / id
+namespace. Persists, per camera:
+  - detections.npy : every per-frame box (for the evaluator's IoU→GT match, full fps,
+                     INCLUDING boxes of tracks later dropped as noise)
   - crops/         : the K=3 best thumbnails per tracklet (area × sharpness)
-  - tracklets.json : per-tracklet metadata (subtype vote, time, crop files, ...)
+  - tracklets.json : per-tracklet metadata (subtype vote, time, crop files, ...) —
+                     tracks under MIN_TRACK_DETECTIONS are dropped HERE, so no
+                     downstream stage (SigLIP/VLM/plate/...) ever pays for noise
 
 Call gpu_setup.ensure_gpu_libs() BEFORE importing this module.
 """
@@ -48,11 +53,12 @@ class _TrackAcc:
         h, w = crop_bgr.shape[:2]
         quality = (h * w) * _laplacian_var(crop_bgr)
         self._seq += 1
-        item = (quality, self._seq, crop_bgr.copy())
+        # .copy() only on actual insert (crop_bgr is a view into the frame — storing it
+        # uncopied would pin whole frames in memory); most boxes lose and need no copy.
         if len(self.heap) < K_CROPS:
-            heapq.heappush(self.heap, item)
+            heapq.heappush(self.heap, (quality, self._seq, crop_bgr.copy()))
         elif quality > self.heap[0][0]:
-            heapq.heapreplace(self.heap, item)
+            heapq.heapreplace(self.heap, (quality, self._seq, crop_bgr.copy()))
 
     def best_crops(self) -> list[np.ndarray]:
         # heap is a min-heap on quality; return best-first
@@ -62,6 +68,11 @@ class _TrackAcc:
 # Sentinel class id for person dets in detections.npy — COCO 'person' is id 0, which
 # would collide with a vehicle class id 0 (india: hatchback) in the flat array.
 PERSON_CLS = 100
+
+# Tracks with fewer detections are detector/tracker flicker: store.py and the matcher
+# already refuse them, so writing their crops/rows only feeds dead work to every
+# downstream stage. detections.npy is NOT filtered (the evaluator needs every box).
+MIN_TRACK_DETECTIONS = 2
 
 
 def _iou(a, b) -> float:
@@ -110,46 +121,45 @@ def run(scene: str, cam: str, max_frames: int | None = None, device: int = 0) ->
     crops_dir = out / "crops"
     crops_dir.mkdir(parents=True, exist_ok=True)
 
-    # fps from the file (fallback 10; c015 in S03 is 8)
+    offset = paths.load_cam_offsets(scene)[cam]
+    prof = profiles.active()
+    pdet = prof.person_detector
+
+    # Optional 2nd detector for 'person' entities (india: UVH-26 has no person class);
+    # each model keeps its own persistent tracker / id namespace ('t' vehicles, 'p' persons).
+    veh_model = YOLO(prof.yolo_model)
+    per_model = YOLO(pdet.weights) if pdet is not None else None
+    common = dict(persist=True, tracker=prof.tracker, half=True, device=device, verbose=False)
+
+    # ONE decode pass (full fps): read each frame once and hand the SAME image to both
+    # trackers. (Two zipped .track(source=...) streams each decoded the video themselves —
+    # every frame decompressed twice; verified bit-identical detections after the switch.)
     cap = cv2.VideoCapture(str(video))
-    fps = cap.get(cv2.CAP_PROP_FPS) or paths.DEFAULT_FPS
-    cap.release()
+    fps = cap.get(cv2.CAP_PROP_FPS) or paths.DEFAULT_FPS  # fallback 10; c015 in S03 is 8
     if not fps or fps <= 0:
         fps = paths.DEFAULT_FPS
-    offset = paths.load_cam_offsets(scene)[cam]
-
-    prof = profiles.active()
-    common = dict(source=str(video), stream=True, persist=True, tracker=prof.tracker,
-                  half=True, device=device, vid_stride=1, verbose=False)  # FULL fps
-
-    veh_model = YOLO(prof.yolo_model)
-    veh_stream = veh_model.track(
-        imgsz=prof.yolo_imgsz, conf=prof.yolo_conf,
-        classes=list(prof.yolo_classes) if prof.yolo_classes else None, **common)
-
-    # Optional 2nd detector for 'person' entities (india: UVH-26 has no person class).
-    # Both stream the same video at vid_stride=1, so zip() stays frame-aligned; each keeps
-    # its own tracker/id namespace ('t' for vehicles, 'p' for persons).
-    pdet = prof.person_detector
-    per_model = None
-    if pdet is not None:
-        per_model = YOLO(pdet.weights)
-        per_stream = per_model.track(imgsz=pdet.imgsz, conf=pdet.conf, classes=[pdet.class_id], **common)
-        paired = zip(veh_stream, per_stream)
-    else:
-        paired = ((r, None) for r in veh_stream)
 
     veh_tracks: dict[int, _TrackAcc] = {}
     person_tracks: dict[int, _TrackAcc] = {}
     detections: list[tuple] = []  # frame,tid,x1,y1,x2,y2,conf,cls
     frame_idx = 0  # 1-based to match MOTChallenge GT
 
-    for veh_r, per_r in paired:
-        frame_idx += 1
-        if max_frames is not None and frame_idx > max_frames:
+    while True:
+        if max_frames is not None and frame_idx >= max_frames:
             break
-        img = veh_r.orig_img
+        ok, img = cap.read()
+        if not ok:
+            break
+        frame_idx += 1
         H, W = img.shape[:2]
+
+        veh_r = veh_model.track(
+            img, imgsz=prof.yolo_imgsz, conf=prof.yolo_conf,
+            classes=list(prof.yolo_classes) if prof.yolo_classes else None, **common)[0]
+        per_r = None
+        if per_model is not None:
+            per_r = per_model.track(img, imgsz=pdet.imgsz, conf=pdet.conf,
+                                    classes=[pdet.class_id], **common)[0]
 
         # person pass: accumulate person tracks + collect boxes for FP suppression
         person_boxes: list[tuple] = []
@@ -175,15 +185,20 @@ def run(scene: str, cam: str, max_frames: int | None = None, device: int = 0) ->
                     continue
                 _accumulate(veh_tracks, detections, frame_idx, int(tid), box, conf, cls, img, W, H)
 
-    # persist detections (for the evaluator)
+    cap.release()
+
+    # persist detections (for the evaluator) — full, noise tracks included
     det_arr = np.array(detections, dtype=np.float32) if detections else np.zeros((0, 8), np.float32)
     np.save(out / "detections.npy", det_arr)
 
     def build(tracks, prefix, resolve):
         """Turn a track-accumulator dict into tracklet metadata + write its crops.
-        prefix namespaces ids/crops/tracklet_ids ('t' vehicles, 'p' persons)."""
+        prefix namespaces ids/crops/tracklet_ids ('t' vehicles, 'p' persons).
+        Noise tracks (< MIN_TRACK_DETECTIONS) are skipped: no crops, no row."""
         rows = []
         for tid, acc in sorted(tracks.items()):
+            if len(acc.frames) < MIN_TRACK_DETECTIONS:
+                continue
             subtype, entity_type = resolve(acc)
             f_start, f_end = min(acc.frames), max(acc.frames)
             ts_start, ts_end = offset + f_start / fps, offset + f_end / fps
@@ -218,5 +233,8 @@ def run(scene: str, cam: str, max_frames: int | None = None, device: int = 0) ->
     del veh_model
     if per_model is not None:
         del per_model
-    return {"cam": cam, "frames": frame_idx, "tracks": len(veh_tracks),
-            "persons": len(person_tracks), "detections": len(detections)}
+    n_veh = sum(1 for t in tracklets if t["entity_type"] != "person")
+    return {"cam": cam, "frames": frame_idx, "tracks": n_veh,
+            "persons": len(tracklets) - n_veh,
+            "dropped_noise": len(veh_tracks) + len(person_tracks) - len(tracklets),
+            "detections": len(detections)}
