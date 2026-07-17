@@ -58,6 +58,10 @@ VLM_GGUF = os.environ.get(
 VLM_MMPROJ = os.environ.get("VLM_MMPROJ", str(_MODELS / "QWEN VLM" / "mmproj-F16.gguf"))
 VLM_PORT = int(os.environ.get("VLM_PORT", "8090"))
 VLM_PARALLEL = int(os.environ.get("VLM_PARALLEL", "4"))   # concurrent slots; 4 saturates the 4050
+# Persons tracked for fewer frames than this are skipped: a 1-2 frame "person" in a
+# crowd is tracker flicker whose crops the VLM answers all-"unknown" on anyway — the
+# tracklet stays stored/searchable (SigLIP vector), it just gets no attribute chips.
+VLM_MIN_DETECTIONS = int(os.environ.get("VLM_MIN_DETECTIONS", "3"))
 VLM_CTX_PER_SLOT = 2048        # per slot: fits K_CROPS images + prompt (default ctx OOMs 6 GB)
 VLM_CTX = VLM_CTX_PER_SLOT * VLM_PARALLEL   # llama.cpp splits total -c across the -np slots
 VLM_MAX_TOKENS = 120
@@ -186,9 +190,11 @@ def _ask(crop_paths: list[str]) -> dict | None:
 def run(scene: str, cam: str) -> dict:
     out = paths.cam_out(scene, cam)
     tracklets = json.loads((out / "tracklets.json").read_text())
-    persons = [(i, t) for i, t in enumerate(tracklets) if t.get("entity_type") == "person"]
+    all_persons = [(i, t) for i, t in enumerate(tracklets) if t.get("entity_type") == "person"]
+    persons = [(i, t) for i, t in all_persons if t["num_detections"] >= VLM_MIN_DETECTIONS]
+    skipped_short = len(all_persons) - len(persons)
     if not persons:
-        return {"cam": cam, "persons": 0}
+        return {"cam": cam, "persons": 0, "skipped_short": skipped_short}
 
     err = _ensure_server()
     if err:
@@ -229,6 +235,6 @@ def run(scene: str, cam: str) -> dict:
             labeled += 1
 
     (out / "tracklets.json").write_text(json.dumps(tracklets, indent=2))
-    return {"cam": cam, "persons": len(persons), "labeled": labeled,
-            "colors": colors, "failures": failures,
+    return {"cam": cam, "persons": len(persons), "skipped_short": skipped_short,
+            "labeled": labeled, "colors": colors, "failures": failures,
             "secs": round(time.time() - t0, 1)}
