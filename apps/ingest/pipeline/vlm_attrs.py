@@ -10,11 +10,14 @@ Per PERSON tracklet, ALL of its K crops go in ONE multi-image request: the promp
 they show the same tracked person, which lets the model (a) reject bystanders that appear
 in only some crops — a single-crop run blended a helmeted scooter rider behind the subject
 into "headwear: helmet" — and (b) combine views (a backpack may only be visible from
-behind). Writes into `person_attrs` JSONB (merged, SigLIP colors kept):
+behind). This stage is the SOLE source of `person_attrs` (the region-split SigLIP color
+stage was removed: fixed torso/legs crop fractions mean-pooled bystanders into wrong
+labels — e.g. a second person in 1 of 3 crops — and with margin 0 it never abstained, so
+its mislabels outranked better VLM answers). Writes into `person_attrs` JSONB:
 
   apparent_gender / age / backpack / headwear  ->  {"name": ...}   ("unknown" -> key omitted)
-  upper_color / lower_color                    ->  fill-in ONLY where the SigLIP region
-                                                   stage abstained, marked {"src": "vlm"}
+  upper_color / lower_color                    ->  {"name": ...}, vocab-constrained in the
+                                                   prompt; off-vocab answers abstain
 
 No confidence field: the VLM emits a label, not a calibrated prob. SOFT ranking signal
 only, never a hard filter (gender/age especially — unscored until the eval set exists).
@@ -60,12 +63,18 @@ VLM_CTX = VLM_CTX_PER_SLOT * VLM_PARALLEL   # llama.cpp splits total -c across t
 VLM_MAX_TOKENS = 120
 VLM_LOAD_TIMEOUT_S = 180       # model load + warmup before /health goes ok
 VLM_REQUEST_TIMEOUT_S = 120
-# A/B eval only: if set to a dir, dump per-cam SigLIP(stage6)-vs-VLM raw colors side by side
-# for the same person tracklets in this one pass (no effect on the production merge below).
-VLM_AB_DUMP = os.environ.get("VLM_AB_DUMP")
 
 _URL = f"http://127.0.0.1:{VLM_PORT}/v1/chat/completions"
 _HEALTH = f"http://127.0.0.1:{VLM_PORT}/health"
+
+# Clothing palette (kept from the removed SigLIP region stage: no vehicle-ish
+# "silver", has pink/purple). Baked into the prompt so colors stay canonical /
+# filterable; an off-vocab answer is treated as an abstain at merge time.
+VLM_COLOR_VOCAB = (
+    "white", "black", "gray", "red", "blue", "green",
+    "yellow", "orange", "brown", "pink", "purple",
+)
+_COLOR_CHOICES = "/".join(f'"{c}"' for c in VLM_COLOR_VOCAB)
 
 PROMPT = (
     "These images are crops of the SAME person tracked across consecutive CCTV frames "
@@ -76,8 +85,8 @@ PROMPT = (
     'with a JSON object, no other text. Use "unknown" whenever the crops are too '
     'small, blurry, or occluded to tell. Keys: gender ("male"/"female"/"unknown"), '
     'age_group ("child"/"adult"/"elderly"/"unknown"), backpack ("yes"/"no"/"unknown"), '
-    'headwear ("none"/"cap"/"helmet"/"turban"/"scarf"/"unknown"), upper_color, '
-    "lower_color."
+    'headwear ("none"/"cap"/"helmet"/"turban"/"scarf"/"unknown"), upper_color and '
+    f"lower_color (each one of: {_COLOR_CHOICES}/\"unknown\")."
 )
 
 # VLM response key -> person_attrs key (gender is presentation, never identity).
@@ -90,8 +99,11 @@ _ATTR_KEYS = {
 _COLOR_KEYS = ("upper_color", "lower_color")
 # Keys this stage OWNS: cleared before merging so stale values from a previous attribute
 # pass never survive next to fresh answers; an abstained attribute must end up absent,
-# not outdated. (carrying/footwear/…types are legacy keys of a removed stage.)
-_OWNED_KEYS = (*_ATTR_KEYS.values(), "carrying", "footwear", "upper_type", "lower_type")
+# not outdated. Colors are owned too since the SigLIP region stage was removed — old
+# SigLIP-written labels must not survive a re-run. (carrying/footwear/…types are legacy
+# keys of removed stages.)
+_OWNED_KEYS = (*_ATTR_KEYS.values(), *_COLOR_KEYS,
+               "carrying", "footwear", "upper_type", "lower_type")
 
 _proc: subprocess.Popen | None = None
 
@@ -183,7 +195,7 @@ def run(scene: str, cam: str) -> dict:
         return {"cam": cam, "skipped": err}
 
     t0 = time.time()
-    labeled = failures = color_fills = 0
+    labeled = failures = colors = 0
 
     # Resolve each person's crops up front, then fan the requests out across the server's
     # VLM_PARALLEL slots. _ask is pure/thread-safe; the merge below stays single-threaded so
@@ -194,44 +206,29 @@ def run(scene: str, cam: str) -> dict:
     with ThreadPoolExecutor(max_workers=VLM_PARALLEL) as ex:
         answers = list(ex.map(lambda w: (w[0], _ask(w[1])), work))
 
-    ab_rows = []                               # A/B eval only (VLM_AB_DUMP)
     for i, ans in answers:
-        sig = tracklets[i].get("person_attrs") or {}   # SigLIP region colors (stage 6), pre-merge
-        if VLM_AB_DUMP:
-            ab_rows.append({
-                "tracklet_id": tracklets[i]["tracklet_id"],
-                "cam": cam, "num_detections": tracklets[i]["num_detections"],
-                "crop_refs": tracklets[i]["crop_refs"],
-                "siglip_upper": sig.get("upper_color"), "siglip_lower": sig.get("lower_color"),
-                "vlm_upper": None if ans is None else str(ans.get("upper_color", "")).strip().lower() or None,
-                "vlm_lower": None if ans is None else str(ans.get("lower_color", "")).strip().lower() or None,
-                "vlm_failed": ans is None,
-            })
         if ans is None:
             failures += 1
             continue
-        attrs = {k: v for k, v in sig.items() if k not in _OWNED_KEYS}
+        prev = tracklets[i].get("person_attrs") or {}
+        attrs = {k: v for k, v in prev.items() if k not in _OWNED_KEYS}
         wrote = False
         for vk, sk in _ATTR_KEYS.items():
             name = str(ans.get(vk, "unknown")).strip().lower()
             if name and name != "unknown":
                 attrs[sk] = {"name": name}
                 wrote = True
-        for ck in _COLOR_KEYS:                  # SigLIP region color wins; VLM fills gaps
+        for ck in _COLOR_KEYS:                  # off-vocab (incl. "unknown") -> abstain
             name = str(ans.get(ck, "unknown")).strip().lower()
-            if ck not in attrs and name and name != "unknown":
-                attrs[ck] = {"name": name, "src": "vlm"}
-                color_fills += 1
+            if name in VLM_COLOR_VOCAB:
+                attrs[ck] = {"name": name}
+                colors += 1
                 wrote = True
         tracklets[i]["person_attrs"] = attrs   # write even if all-unknown: stale keys stripped
         if wrote:
             labeled += 1
 
     (out / "tracklets.json").write_text(json.dumps(tracklets, indent=2))
-    if VLM_AB_DUMP:
-        os.makedirs(VLM_AB_DUMP, exist_ok=True)
-        with open(os.path.join(VLM_AB_DUMP, f"{scene}_{cam}_abcolors.json"), "w") as f:
-            json.dump(ab_rows, f, indent=2)
     return {"cam": cam, "persons": len(persons), "labeled": labeled,
-            "color_fills": color_fills, "failures": failures,
+            "colors": colors, "failures": failures,
             "secs": round(time.time() - t0, 1)}
