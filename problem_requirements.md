@@ -71,3 +71,12 @@ Tracking sheet against the Surat Smart City problem statement
   statement's own worked queries need the II.b time/camera filters to be typeable
 - ❌ Sample forensic export with metadata
 - ❌ Documentation (models, indexing, integrity controls) — deferred to the end
+
+## Some More things to Fix
+- 1. HNSW recall — likely a real, free win. schema.sql builds the index with defaults, and the backend never sets hnsw.ef_search, so every query runs at pgvector's default of 40 candidates. That was fine at 1,233 CityFlow rows, but a full SUR01 ingest is ~24k+ tracklets — at that scale ef_search=40 will genuinely drop true neighbors, and it manifests exactly as "the search missed a clip that's obviously there." Honestly, at 30k rows × 1152 dims you can afford to skip the ANN index entirely and brute-force scan (tens of ms) for guaranteed 100% recall, or just SET LOCAL hnsw.ef_search = 200 per query. Your memory already flags ef_search as an open item — this is it coming due.
+
+- K_CROPS = 3 + mean-pooling — the semantic-vector knob. Each tracklet's search vector is the mean of only its 3 "best" crops, where best = area × Laplacian sharpness (detect_track.py:54). Two things to consider:
+    Raising K to ~5–7 adds viewpoint diversity to the mean cheaply (siglip pass is batched; cost is linear and offline). The area×sharpness metric also biases toward the closest-to-camera frame, which for fast vehicles is often the motion-blurred or most-occluded one — worth eyeballing what it picks.
+    The bigger structural option: mean-pooling blurs away single-view attributes. A query like "text on the back of a truck" or "bag on left shoulder" matches one crop strongly and the mean weakly. Storing per-crop vectors and taking max-similarity per tracklet at query time is the highest-ceiling retrieval change available — but it's a schema/search rework (N rows per tracklet), so I'd file it, not rush it.
+    
+- Prompt-template the text query. SigLIP was trained on caption-style text; embedding the user's raw fragment ("man red shirt") is measurably worse than "a photo of a man in a red shirt". Even a fixed wrapper f"a cctv photo of {q}" is worth an A/B — you already have the pattern from the color vocab ensemble.
