@@ -10,7 +10,9 @@ SAME SigLIP2 space search already uses:
 It REUSES the mean-pooled tracklet vector (vec/semantic.npy) written by the siglip
 pass — no image re-encode — and only runs the (tiny) text tower over a fixed color
 vocabulary. Writes the winning name into each tracklet's `color` field in
-tracklets.json, which store.py already reads via t.get("color").
+tracklets.json, which store.py already reads via t.get("color"). Vehicle tracklets
+only: persons get color=None here — their outfit colors are person_attrs
+(upper_color/lower_color), owned by the vlm_attrs stage.
 
 Run AFTER siglip and BEFORE store. The 56-dim HSV signature (attributes.py) is left
 untouched; the matcher still fuses it.
@@ -92,6 +94,9 @@ def run(scene: str, cam: str, device: int = 0) -> dict:
 
     named = 0
     for i, t in enumerate(tracklets):
+        if t.get("entity_type") == "person":           # outfit colors live in person_attrs (vlm_attrs)
+            t["color"] = None
+            continue
         if np.linalg.norm(sem[i]) < 1e-6:              # empty/no-crop tracklet
             t["color"] = None
             continue

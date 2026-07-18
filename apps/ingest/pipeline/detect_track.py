@@ -129,7 +129,7 @@ def run(scene: str, cam: str, max_frames: int | None = None, device: int = 0) ->
     # each model keeps its own persistent tracker / id namespace ('t' vehicles, 'p' persons).
     veh_model = YOLO(prof.yolo_model)
     per_model = YOLO(pdet.weights) if pdet is not None else None
-    common = dict(persist=True, tracker=prof.tracker, half=True, device=device, verbose=False)
+    common = dict(persist=True, tracker=prof.tracker, quantize=16, device=device, verbose=False)
 
     # ONE decode pass (full fps): read each frame once and hand the SAME image to both
     # trackers. (Two zipped .track(source=...) streams each decoded the video themselves —

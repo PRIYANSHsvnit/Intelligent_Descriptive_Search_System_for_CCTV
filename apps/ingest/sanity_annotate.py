@@ -93,7 +93,7 @@ def main() -> int:
     writer = ff.stdin
 
     common = dict(source=str(src), stream=True, persist=True, tracker=prof.tracker,
-                  half=True, vid_stride=1, verbose=False)
+                  quantize=16, vid_stride=1, verbose=False)
     agnostic = not args.no_agnostic_nms
     veh_model = YOLO(prof.yolo_model)
     veh_stream = veh_model.track(imgsz=prof.yolo_imgsz, conf=args.conf, agnostic_nms=agnostic,
