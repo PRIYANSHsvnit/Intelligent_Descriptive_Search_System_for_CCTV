@@ -108,14 +108,14 @@ def inherit_gt_ids(scene: str, cam: str) -> dict[int, int]:
 
 
 # --------------------------------------------------------------------------- rank-1/5
-def _fused_vectors(scene: str, cams: list[str], w: float):
+def _fused_vectors(scene: str, cams: list[str], w: float, appfile: str = "reid_appearance.npy"):
     """Return per-tracklet fused reid vectors with inherited GT ids, across cams."""
     entries = []  # (cam, gt_id, fused_vec)
     for cam in cams:
         out = paths.cam_out(scene, cam)
         tracklets = json.loads((out / "tracklets.json").read_text())
         color = np.load(out / "vec" / "reid_color.npy")
-        app_p = out / "vec" / "reid_appearance.npy"
+        app_p = out / "vec" / appfile
         app = np.load(app_p) if app_p.exists() else None
         tid2gt = inherit_gt_ids(scene, cam)
         # track_id order in tracklets.json matches vec row order
@@ -134,8 +134,9 @@ def _fused_vectors(scene: str, cams: list[str], w: float):
     return entries
 
 
-def rank_cmc(scene: str, cams: list[str], w: float = 1.0) -> dict:
-    entries = _fused_vectors(scene, cams, w)
+def rank_cmc(scene: str, cams: list[str], w: float = 1.0,
+            appfile: str = "reid_appearance.npy") -> dict:
+    entries = _fused_vectors(scene, cams, w, appfile)
     if not entries:
         return {"queries": 0, "rank1": None, "rank5": None}
     vecs = np.stack([e[2] for e in entries])
@@ -162,7 +163,8 @@ def rank_cmc(scene: str, cams: list[str], w: float = 1.0) -> dict:
         "queries": valid,
         "rank1": round(r1 / valid, 4) if valid else None,
         "rank5": round(r5 / valid, 4) if valid else None,
-        "appearance": (paths.cam_out(scene, cams[0]) / "vec" / "reid_appearance.npy").exists(),
+        "appearance": (paths.cam_out(scene, cams[0]) / "vec" / appfile).exists(),
+        "appfile": appfile,
         "fusion_w": w,
     }
 
@@ -227,6 +229,8 @@ def main() -> int:
     ap.add_argument("--scene", default="S01")
     ap.add_argument("--cams", nargs="*", default=None)
     ap.add_argument("--fusion-w", type=float, default=1.0)
+    ap.add_argument("--appfile", default="reid_appearance.npy",
+                    help="per-tracklet appearance vector file under <cam>/vec/ (for encoder A/B)")
     ap.add_argument("--oracle-only", action="store_true")
     ap.add_argument("--profile", default="cityflow", choices=list(profiles.PROFILES))
     args = ap.parse_args()
@@ -239,7 +243,7 @@ def main() -> int:
 
     if not args.oracle_only:
         print("\n[rank-1/5 cross-camera] (tuning diagnostic only)")
-        print("  ", rank_cmc(args.scene, cams, w=args.fusion_w))
+        print("  ", rank_cmc(args.scene, cams, w=args.fusion_w, appfile=args.appfile))
 
         gid_path = paths.OUTPUT_ROOT / args.scene / "global_ids.json"
         if gid_path.exists():

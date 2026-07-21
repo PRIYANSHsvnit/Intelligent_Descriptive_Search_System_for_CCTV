@@ -5,13 +5,13 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-docker run --rm -v "$PWD":/w -w /w python:3.9-slim bash -lc '
+docker run --rm -e REID_CFG -e REID_WEIGHTS -e REID_OUT -v "$PWD":/w -w /w python:3.9-slim bash -lc '
   set -e
   apt-get update -qq && apt-get install -y -qq git build-essential >/dev/null
   pip install -q torch==1.13.1 torchvision==0.14.1 --index-url https://download.pytorch.org/whl/cpu
   pip install -q yacs termcolor scikit-learn tabulate "numpy<2" Pillow onnx
-  git clone -q --depth 1 https://github.com/JDAI-CV/fast-reid.git
+  [ -d fast-reid/fastreid ] || git clone -q --depth 1 https://github.com/JDAI-CV/fast-reid.git
   PYTHONPATH=/w/fast-reid python export_reid_onnx.py
 '
 echo "---"
-ls -la veri_reid.onnx
+ls -la *.onnx
