@@ -17,6 +17,10 @@ dependencies = [
     # DB
     "psycopg[binary]>=3.2",
     "pgvector>=0.3",
+    # Groq query rewrite/translate (translate + caption-template before SigLIP)
+    "httpx>=0.27",
+    # load apps/backend_py/.env (GROQ_API_KEY) at startup
+    "python-dotenv>=1.0",
 ]
 
 [tool.uv]

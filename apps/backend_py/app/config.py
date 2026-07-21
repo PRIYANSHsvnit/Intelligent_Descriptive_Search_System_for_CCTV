@@ -6,6 +6,13 @@ import json
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+# Load apps/backend_py/.env (GROQ_API_KEY etc.) before anything reads os.environ.
+# config.py is imported first by every module, so this runs early. does not override
+# vars already set in the shell.
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+
 # LOCKED — identical to apps/ingest/constants.py SIGLIP_MODEL. Do not diverge.
 SIGLIP_MODEL = "google/siglip2-so400m-patch14-224"
 SEMANTIC_DIM = 1152

@@ -54,8 +54,11 @@ Tracking sheet against the Surat Smart City problem statement
 
 ## Bonus Points
 
-- ❌ Multi-language query support (Gujarati, Hindi)
-  — planned: Groq `llama-3.1-8b-instant` translate-then-encode in front of SigLIP
+- ✅ Multi-language query support (Gujarati, Hindi)
+  — Groq `llama-3.1-8b-instant` translate + caption-rewrite in front of SigLIP
+  (`query_rewrite.py`); verified end-to-end on SUR01 — Hindi "पीली शर्ट में आदमी"
+  and English "man in yellow shirt" rewrite to the same caption and return the
+  same ranked results; fail-open to a static `"a photo of {q}"` template
 - ✅ License-plate integration
   — two-tier plate OCR (`plate_text`/`plate_raw`) + layered exact/partial/fuzzy
   `/search?plate=`; plate-based tracklet stitching
@@ -79,4 +82,8 @@ Tracking sheet against the Surat Smart City problem statement
     Raising K to ~5–7 adds viewpoint diversity to the mean cheaply (siglip pass is batched; cost is linear and offline). The area×sharpness metric also biases toward the closest-to-camera frame, which for fast vehicles is often the motion-blurred or most-occluded one — worth eyeballing what it picks.
     The bigger structural option: mean-pooling blurs away single-view attributes. A query like "text on the back of a truck" or "bag on left shoulder" matches one crop strongly and the mean weakly. Storing per-crop vectors and taking max-similarity per tracklet at query time is the highest-ceiling retrieval change available — but it's a schema/search rework (N rows per tracklet), so I'd file it, not rush it.
     
-- Prompt-template the text query. SigLIP was trained on caption-style text; embedding the user's raw fragment ("man red shirt") is measurably worse than "a photo of a man in a red shirt". Even a fixed wrapper f"a cctv photo of {q}" is worth an A/B — you already have the pattern from the color vocab ensemble.
+- ✅ Prompt-template the text query. DONE via the same `query_rewrite.py` Groq hook:
+  every query is rewritten to caption style ("man red shirt" → "a man in a red
+  shirt") before SigLIP encoding, with a static `"a photo of {q}"` wrapper as the
+  fail-open fallback (so the fixed-template win holds even without Groq). Negations
+  ("without helmet") are preserved verbatim by the prompt.

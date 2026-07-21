@@ -11,7 +11,7 @@ import torch
 from pgvector.psycopg import register_vector
 from transformers import AutoModel, AutoProcessor
 
-from . import config
+from . import config, query_rewrite
 
 _processor = None
 _model = None
@@ -277,7 +277,14 @@ def _search_with_vec(qvec, entity_type, scene, t0, t1, limit):
 
 
 def search(query, entity_type, scene, t0, t1, limit):
-    return _search_with_vec(encode_text(query), entity_type, scene, t0, t1, limit)
+    # translate (Gujarati/Hindi/…→English) + caption-template the raw query so it
+    # lands in SigLIP's caption-trained space; fail-open to a static wrapper.
+    rewritten = query_rewrite.rewrite(query)
+    out = _search_with_vec(encode_text(rewritten), entity_type, scene, t0, t1, limit)
+    # debug/demo transparency — drop these two fields before shipping.
+    out["original_query"] = query
+    out["rewritten_query"] = rewritten
+    return out
 
 
 def search_image(img, entity_type, scene, t0, t1, limit):
