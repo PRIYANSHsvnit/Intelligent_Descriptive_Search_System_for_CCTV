@@ -58,15 +58,23 @@ def search(
                               description="registration query, full or partial (e.g. 'GJ05AY1139' or '1139')"),
     type: str | None = Query(None, pattern="^(vehicle|person)$"),
     scene: str | None = None,
+    camera_id: str | None = Query(None, description="restrict to one camera/location"),
+    color: str | None = Query(None, description="filter by stored colour name (vehicle-level)"),
     t0: float | None = None,
     t1: float | None = None,
     limit: int = Query(20, ge=1, le=100),
 ):
     if plate:
-        return engine.search_plate(plate, scene, limit)
+        return engine.search_plate(plate, scene, limit, camera_id=camera_id)
     if not q:
         raise HTTPException(422, "provide q (description) or plate")
-    return engine.search(q, type, scene, t0, t1, limit)
+    return engine.search(q, type, scene, t0, t1, limit, camera_id=camera_id, color=color)
+
+
+@app.get("/scene-cameras/{scene}")
+def scene_cameras(scene: str):
+    """Cameras + labels + counts + coverage for the location picker."""
+    return engine.scene_cameras(scene)
 
 
 @app.post("/search/image")
@@ -74,6 +82,8 @@ async def search_image(
     image: UploadFile = File(..., description="tight crop of the vehicle/person"),
     type: str | None = Form(None),
     scene: str | None = Form(None),
+    camera_id: str | None = Form(None),
+    color: str | None = Form(None),
     t0: float | None = Form(None),
     t1: float | None = Form(None),
     limit: int = Form(20),
@@ -87,7 +97,8 @@ async def search_image(
     except Exception:
         raise HTTPException(422, "could not decode image")
     return engine.search_image(img, type or None, scene or None, t0, t1,
-                               min(max(limit, 1), 100))
+                               min(max(limit, 1), 100),
+                               camera_id=camera_id or None, color=color or None)
 
 
 @app.get("/search/similar")

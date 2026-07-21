@@ -70,7 +70,7 @@ _SELECT = """
 """
 
 
-def _run_query(qvec, entity_type, scene, t0, t1, limit) -> list[dict]:
+def _run_query(qvec, entity_type, scene, t0, t1, limit, camera_id=None, color=None) -> list[dict]:
     where = ["semantic_vector IS NOT NULL"]
     params = {"q": qvec, "lim": limit}
     if entity_type:
@@ -79,6 +79,12 @@ def _run_query(qvec, entity_type, scene, t0, t1, limit) -> list[dict]:
     if scene:
         where.append("scene = %(scene)s")
         params["scene"] = scene
+    if camera_id:
+        where.append("camera_id = %(cam)s")
+        params["cam"] = camera_id
+    if color:
+        where.append("color = %(color)s")
+        params["color"] = color
     if t0 is not None and t1 is not None:  # tracklet overlaps [t0, t1]
         where.append("ts_start_s <= %(t1)s AND ts_end_s >= %(t0)s")
         params["t0"], params["t1"] = t0, t1
@@ -184,7 +190,7 @@ _PLATE_SELECT = """
 """
 
 
-def search_plate(plate_query, scene, limit, min_sim=0.30):
+def search_plate(plate_query, scene, limit, min_sim=0.30, camera_id=None):
     """Layered plate lookup, tiered so retrieval never over-claims:
     exact on the validated plate first, then substring on both tiers (partial
     queries like '1139'), then trigram similarity (catches raw reads such as
@@ -196,8 +202,11 @@ def search_plate(plate_query, scene, limit, min_sim=0.30):
     params = {"p": p, "pat": f"%{p}%", "minsim": min_sim, "lim": limit}
     extra = ""
     if scene:
-        extra = "AND scene = %(scene)s"
+        extra += " AND scene = %(scene)s"
         params["scene"] = scene
+    if camera_id:
+        extra += " AND camera_id = %(cam)s"
+        params["cam"] = camera_id
     with _connect() as conn, conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
         cur.execute(_PLATE_SELECT.format(extra=extra), params)
         rows = cur.fetchall()
@@ -261,37 +270,40 @@ def _shape_result(r: dict) -> dict:
     }
 
 
-def _search_with_vec(qvec, entity_type, scene, t0, t1, limit):
+def _search_with_vec(qvec, entity_type, scene, t0, t1, limit, camera_id=None, color=None):
     """Shared tail for text and image queries: pgvector search + fail-open + dedup."""
     fetch = max(limit * 4, 40)  # over-fetch so dedup still returns ~limit
-    rows = _run_query(qvec, entity_type, scene, t0, t1, fetch)
+    rows = _run_query(qvec, entity_type, scene, t0, t1, fetch, camera_id, color)
 
     fell_back = False
-    if not rows and (entity_type or (t0 is not None)):
-        # fail open: a starving filter (type/time) — drop it, keep the reliable scene
-        rows = _run_query(qvec, None, scene, None, None, fetch)
+    if not rows and (entity_type or color or (t0 is not None)):
+        # fail open: a starving soft filter (type/colour/time) — drop those, but keep the
+        # intentional scene + camera location the user picked
+        rows = _run_query(qvec, None, scene, None, None, fetch, camera_id, None)
         fell_back = True
 
     rows = _dedup(rows)[:limit]
     return {"results": [_shape_result(r) for r in rows], "fell_back": fell_back}
 
 
-def search(query, entity_type, scene, t0, t1, limit):
+def search(query, entity_type, scene, t0, t1, limit, camera_id=None, color=None):
     # translate (Gujarati/Hindi/…→English) + caption-template the raw query so it
     # lands in SigLIP's caption-trained space; fail-open to a static wrapper.
     rewritten = query_rewrite.rewrite(query)
-    out = _search_with_vec(encode_text(rewritten), entity_type, scene, t0, t1, limit)
+    out = _search_with_vec(encode_text(rewritten), entity_type, scene, t0, t1, limit,
+                           camera_id, color)
     # debug/demo transparency — drop these two fields before shipping.
     out["original_query"] = query
     out["rewritten_query"] = rewritten
     return out
 
 
-def search_image(img, entity_type, scene, t0, t1, limit):
+def search_image(img, entity_type, scene, t0, t1, limit, camera_id=None, color=None):
     """Reference-image search: SigLIP image tower → same vector space as text.
     NOTE image↔image scores run much higher than text↔image (modality gap) —
     ranking is comparable, absolute scores are not."""
-    return _search_with_vec(encode_image(img), entity_type, scene, t0, t1, limit)
+    return _search_with_vec(encode_image(img), entity_type, scene, t0, t1, limit,
+                            camera_id, color)
 
 
 # "more like this": the stored vectors ARE valid query vectors, so similarity search
@@ -349,6 +361,31 @@ def search_similar(tracklet_id: str, vec: str, limit: int):
 
     rows = _dedup(rows)[:limit]
     return {"results": [_shape_result(r) for r in rows], "fell_back": fell_back}
+
+
+def scene_cameras(scene: str) -> dict:
+    """Cameras in a scene with their label, indexed count, and time-of-day coverage —
+    feeds the frontend location picker (each SUR01 camera is its own location today)."""
+    sql = """
+        SELECT camera_id, COUNT(*) AS n,
+               MIN(ts_start_s) AS t0, MAX(ts_end_s) AS t1
+        FROM tracklets WHERE scene = %s AND semantic_vector IS NOT NULL
+        GROUP BY camera_id ORDER BY camera_id
+    """
+    with _connect() as conn, conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+        cur.execute(sql, (scene,))
+        rows = cur.fetchall()
+    cams = [
+        {
+            "camera_id": r["camera_id"],
+            "camera_label": config.camera_label(scene, r["camera_id"]),
+            "count": r["n"],
+            "ts_start_s": round(r["t0"], 2),
+            "ts_end_s": round(r["t1"], 2),
+        }
+        for r in rows
+    ]
+    return {"scene": scene, "cameras": cams, "total": sum(c["count"] for c in cams)}
 
 
 def trace(scene: str, global_id: int):
