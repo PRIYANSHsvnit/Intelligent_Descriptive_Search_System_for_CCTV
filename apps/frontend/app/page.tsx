@@ -1,4 +1,5 @@
 "use client";
+/* eslint-disable @next/next/no-img-element -- evidence images are served dynamically by FastAPI */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styles from "./page.module.css";
@@ -27,6 +28,27 @@ type Result = {
   plate_conf?: number | null;
   sightings?: number;
   matched_on?: "exact" | "partial" | "fuzzy";
+  matched_crop_ref?: string | null;
+  component_scores?: { caption: string; score: number }[];
+};
+
+type SearchEvidenceContext = {
+  original_query: string;
+  rewritten_query?: string | null;
+  timestamp_utc: string;
+  filters: Record<string, string | number | null>;
+  method: string;
+  aggregation?: string | null;
+  composition?: string | null;
+  search_captions?: string[];
+};
+
+type VerificationResult = {
+  valid: boolean;
+  status: "VALID" | "TAMPERED";
+  export_id?: string | null;
+  errors: string[];
+  warnings: string[];
 };
 
 type Camera = {
@@ -47,6 +69,11 @@ type Hop = {
   video_end_s?: number;
   crop_url: string | null;
   video_url: string | null;
+};
+
+type Suggestion = {
+  action: "expand_time" | "remove_color" | "all_entity_types";
+  label: string;
 };
 
 // describe/plate examples share one bar — clicking a plate one flips the detected mode
@@ -98,6 +125,7 @@ export default function Home() {
 
   const [results, setResults] = useState<Result[]>([]);
   const [fellBack, setFellBack] = useState(false);
+  const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
   const [active, setActive] = useState<Result | null>(null);
@@ -105,6 +133,9 @@ export default function Home() {
   const [imgPreview, setImgPreview] = useState<string | null>(null);
   const [context, setContext] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [searchEvidence, setSearchEvidence] = useState<SearchEvidenceContext | null>(null);
+  const [verification, setVerification] = useState<VerificationResult | null>(null);
+  const [verifying, setVerifying] = useState(false);
 
   const auto = detectMode(q);
   const effMode: "plate" | "describe" = forceMode ?? auto;
@@ -137,8 +168,25 @@ export default function Home() {
       const data = await r.json();
       setResults(data.results ?? []);
       setFellBack(Boolean(data.fell_back));
+      setSuggestions(data.suggestions ?? []);
+      setSearchEvidence({
+        original_query: query,
+        rewritten_query: data.rewritten_query ?? null,
+        timestamp_utc: data.searched_at_utc ?? new Date().toISOString(),
+        filters: {
+          scene, camera_id: cameraId || null,
+          t0: timeSet ? hhmmToSec(tFrom) : null,
+          t1: timeSet ? hhmmToSec(tTo) : null,
+          query_mode: em,
+        },
+        method: em === "plate" ? "layered_plate_lookup" : (data.search_mode ?? "semantic_search"),
+        aggregation: data.aggregation ?? null,
+        composition: data.composition ?? "weighted",
+        search_captions: data.search_captions ?? [],
+      });
     } catch (e) {
       setResults([]);
+      setSuggestions([]);
       setError(`Search failed (${e instanceof Error ? e.message : "network"}) — is the backend running?`);
     } finally {
       setLoading(false);
@@ -159,8 +207,21 @@ export default function Home() {
       const data = await r.json();
       setResults(data.results ?? []);
       setFellBack(Boolean(data.fell_back));
+      setSuggestions(data.suggestions ?? []);
+      setSearchEvidence({
+        original_query: "[reference image search]",
+        timestamp_utc: data.searched_at_utc ?? new Date().toISOString(),
+        filters: {
+          scene, camera_id: cameraId || null,
+          t0: timeSet ? hhmmToSec(tFrom) : null,
+          t1: timeSet ? hhmmToSec(tTo) : null,
+        },
+        method: data.search_mode ?? "siglip_image_search",
+        aggregation: data.aggregation ?? null,
+      });
     } catch (e) {
       setResults([]);
+      setSuggestions([]);
       setError(`Image search failed (${e instanceof Error ? e.message : "network"}).`);
     } finally {
       setLoading(false);
@@ -178,11 +239,17 @@ export default function Home() {
       const res = await fetch(`${API}/search/similar?${p}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
-      setResults(data.results ?? []); setFellBack(false);
+      setResults(data.results ?? []); setFellBack(false); setSuggestions([]);
+      setSearchEvidence({
+        original_query: `${vec} similarity from ${r.tracklet_id}`,
+        timestamp_utc: new Date().toISOString(),
+        filters: { source_tracklet_id: r.tracklet_id, entity_type: r.subtype },
+        method: vec === "reid" ? "reid_similarity" : "semantic_similarity",
+      });
       if (data.fell_back && vec === "reid")
         setContext(`look-alikes of ${r.subtype} ${r.tracklet_id} (no re-ID vector stored — visual similarity only)`);
     } catch (e) {
-      setResults([]); setError(`Similar search failed (${e instanceof Error ? e.message : "network"}).`);
+      setResults([]); setSuggestions([]); setError(`Similar search failed (${e instanceof Error ? e.message : "network"}).`);
     } finally { setLoading(false); }
   }, []);
 
@@ -201,6 +268,19 @@ export default function Home() {
   }, [cameraId, timeSet, tFrom, tTo, scene]);
 
   const selectedCam = cameras.find((c) => c.camera_id === cameraId);
+
+  const verifyPackage = useCallback(async (file: File | null) => {
+    if (!file) return;
+    setVerifying(true); setVerification(null);
+    try {
+      const body = new FormData(); body.append("package", file);
+      const response = await fetch(`${API}/forensics/verify`, { method: "POST", body });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      setVerification(await response.json());
+    } catch (e) {
+      setVerification({ valid: false, status: "TAMPERED", errors: [e instanceof Error ? e.message : "verification failed"], warnings: [] });
+    } finally { setVerifying(false); }
+  }, []);
   const activeChips = useMemo(() => {
     const chips: { label: string; clear: () => void }[] = [];
     if (selectedCam) chips.push({ label: selectedCam.camera_label, clear: () => setCameraId("") });
@@ -222,10 +302,22 @@ export default function Home() {
           </div>
         </div>
         <div className={styles.spacer} />
+        <label className={styles.verifyBtn}>
+          {verifying ? "Verifying…" : "Verify export"}
+          <input type="file" accept=".zip,application/zip" hidden disabled={verifying}
+            onChange={(e) => { verifyPackage(e.target.files?.[0] ?? null); e.currentTarget.value = ""; }} />
+        </label>
+        {verification && (
+          <span className={cx(styles.verifyStatus, verification.valid ? styles.valid : styles.tampered)}
+            title={[...verification.errors, ...verification.warnings].join("\n") || "All hashes and signature verified"}>
+            {verification.status}
+          </span>
+        )}
         <div className={styles.scenePick}>
           <span className={styles.dot} />
           <select value={scene} onChange={(e) => setScene(e.target.value)}>
             <option value="SUR01">SUR01 · Surat</option>
+            <option value="surat-live">surat-live · Surat (live)</option>
             <option value="S01">S01 · CityFlow</option>
           </select>
         </div>
@@ -247,7 +339,7 @@ export default function Home() {
 
           {mode === "photo" ? (
             <label className={styles.photofield}>
-              {imgPreview && /* eslint-disable-next-line @next/next/no-img-element */ <img src={imgPreview} alt="query" />}
+              {imgPreview && <img src={imgPreview} alt="query" />}
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M4 16l4.6-4.6a2 2 0 0 1 2.8 0L16 16m-2-2 1.6-1.6a2 2 0 0 1 2.8 0L20 14M14 8h.01M6 20h12a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2Z" /></svg>
               <span>{imgFile ? imgFile.name : "Upload a cropped photo of the vehicle or person…"}</span>
               <input type="file" accept="image/*" hidden onChange={(e) => onPickImage(e.target.files?.[0] ?? null)} />
@@ -319,14 +411,33 @@ export default function Home() {
         {fellBack && <div className={styles.notice}>No matches for those filters — showing the closest results instead.</div>}
         {context && !loading && !error && <div className={styles.notice}>Showing {context}.</div>}
         {error && !loading && <div className={styles.notice}>{error}</div>}
-        {!loading && searched && results.length === 0 && !error && <div className={styles.status}>No results.</div>}
+        {!loading && searched && results.length === 0 && !error && (
+          <div className={styles.emptyState}>
+            <div>No results with the selected filters.</div>
+            {suggestions.length > 0 && (
+              <div className={styles.suggestions}>
+                {suggestions.map((s) => (
+                  <button
+                    type="button"
+                    key={s.action}
+                    onClick={() => {
+                      if (s.action === "expand_time") setTimeSet(false);
+                    }}
+                  >
+                    {s.label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
         <div className={styles.grid}>
           {results.map((r) => (
             <button key={r.tracklet_id} className={styles.card} onClick={() => setActive(r)}>
               <div className={styles.thumbWrap}>
                 {r.crop_url
-                  ? /* eslint-disable-next-line @next/next/no-img-element */ <img className={styles.thumb} src={`${API}${r.crop_url}`} alt={r.subtype} loading="lazy" />
+                  ? <img className={styles.thumb} src={`${API}${r.crop_url}`} alt={r.subtype} loading="lazy" />
                   : <div className={styles.thumb} />}
                 <div className={styles.scan} />
                 <div className={styles.osd}>{(r.camera_label ?? r.camera_id).toUpperCase().slice(0, 12)} · {fmt(r.ts_start_s)}</div>
@@ -352,7 +463,7 @@ export default function Home() {
         </div>
       </div>
 
-      {active && <Player result={active} onClose={() => setActive(null)} onSimilar={runSimilar} />}
+      {active && <Player result={active} search={searchEvidence} onClose={() => setActive(null)} onSimilar={runSimilar} />}
     </main>
   );
 }
@@ -506,12 +617,14 @@ function boxIndexAt(boxes: BoxRow[], t: number): number {
   return ans;
 }
 
-function Player({ result, onClose, onSimilar }: {
-  result: Result; onClose: () => void; onSimilar: (r: Result, vec: "semantic" | "reid") => void;
+function Player({ result, search, onClose, onSimilar }: {
+  result: Result; search: SearchEvidenceContext | null; onClose: () => void;
+  onSimilar: (r: Result, vec: "semantic" | "reid") => void;
 }) {
   const ref = useRef<HTMLVideoElement>(null);
   const boxRef = useRef<SVGRectElement>(null);
   const [boxes, setBoxes] = useState<BoxRow[] | null>(null);
+  const [exportOpen, setExportOpen] = useState(false);
   const src = result.video_url ? `${API}${result.video_url}` : null;
   const seek0 = result.video_start_s ?? result.ts_start_s;
   const seek1 = result.video_end_s ?? result.ts_end_s;
@@ -535,7 +648,8 @@ function Player({ result, onClose, onSimilar }: {
       const t = v.currentTime, i = boxIndexAt(boxes, t), cur = i >= 0 ? boxes[i] : undefined;
       const GAP = 0.5;
       if (!cur || t - cur[0] > GAP) { rect.setAttribute("visibility", "hidden"); return; }
-      let [t0, x1, y1, x2, y2] = cur;
+      const t0 = cur[0];
+      let [, x1, y1, x2, y2] = cur;
       const nxt = boxes[i + 1];
       if (nxt && nxt[0] > t0 && nxt[0] - t0 <= GAP) {
         const a = (t - t0) / (nxt[0] - t0);
@@ -562,8 +676,10 @@ function Player({ result, onClose, onSimilar }: {
           </span>
           <button className={styles.simBtn} onClick={() => onSimilar(result, "semantic")} title="objects that look like this one">similar look</button>
           <button className={styles.simBtn} onClick={() => onSimilar(result, "reid")} title="other sightings of this exact object">same object</button>
+          <button className={styles.exportBtn} onClick={() => setExportOpen((v) => !v)}>Export evidence</button>
           <button className={styles.close} onClick={onClose}>✕</button>
         </div>
+        {exportOpen && <ExportPanel result={result} search={search} />}
         {src ? (
           <div className={styles.videoWrap}>
             <video ref={ref} className={styles.video} src={src} controls autoPlay
@@ -574,6 +690,69 @@ function Player({ result, onClose, onSimilar }: {
         ) : <div className={styles.status}>No video for this tracklet.</div>}
         {result.global_id != null && <TraceView scene={result.scene} globalId={result.global_id} />}
       </div>
+    </div>
+  );
+}
+
+function ExportPanel({ result, search }: { result: Result; search: SearchEvidenceContext | null }) {
+  const [caseId, setCaseId] = useState(`CASE-${new Date().toISOString().slice(0, 10).replaceAll("-", "")}`);
+  const [officer, setOfficer] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+
+  const create = async () => {
+    if (!caseId.trim() || !officer.trim()) {
+      setMessage("Case ID and officer / user are required for chain-of-custody metadata.");
+      return;
+    }
+    setBusy(true); setMessage("Copying source evidence, creating derived files, and signing package…");
+    try {
+      const response = await fetch(`${API}/forensics/export`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          tracklet_id: result.tracklet_id,
+          case_id: caseId,
+          officer,
+          selected_crop_ref: result.matched_crop_ref,
+          search: search ? {
+            original_query: search.original_query,
+            rewritten_query: search.rewritten_query,
+            timestamp_utc: search.timestamp_utc,
+            filters: search.filters,
+          } : {},
+          retrieval: {
+            method: search?.method ?? "unspecified",
+            aggregation: search?.aggregation,
+            composition: search?.composition,
+            search_captions: search?.search_captions ?? [],
+            result_score: result.score,
+            component_scores: result.component_scores ?? [],
+          },
+        }),
+      });
+      if (!response.ok) {
+        const detail = await response.json().catch(() => null);
+        throw new Error(detail?.detail ?? `HTTP ${response.status}`);
+      }
+      const blob = await response.blob();
+      const disposition = response.headers.get("Content-Disposition") ?? "";
+      const filename = disposition.match(/filename="?([^";]+)"?/)?.[1] ?? `${caseId || "case-export"}.zip`;
+      const href = URL.createObjectURL(blob);
+      const anchor = document.createElement("a"); anchor.href = href; anchor.download = filename;
+      document.body.appendChild(anchor); anchor.click(); anchor.remove(); URL.revokeObjectURL(href);
+      setMessage(`Export signed and downloaded · ${response.headers.get("X-Forensic-Export-ID") ?? filename}`);
+    } catch (e) {
+      setMessage(`Export failed: ${e instanceof Error ? e.message : "unknown error"}`);
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <div className={styles.exportPanel}>
+      <div><strong>Forensic export</strong><span>Source recording remains unannotated; derived files are labelled and signed.</span></div>
+      <label>Case ID<input value={caseId} maxLength={120} onChange={(e) => setCaseId(e.target.value)} /></label>
+      <label>Officer / user<input value={officer} maxLength={120} placeholder="Name or badge ID" onChange={(e) => setOfficer(e.target.value)} /></label>
+      <button type="button" disabled={busy} onClick={create}>{busy ? "Building package…" : "Create signed ZIP"}</button>
+      {message && <p>{message}</p>}
     </div>
   );
 }
@@ -603,7 +782,6 @@ function TraceView({ scene, globalId }: { scene: string; globalId: number }) {
       <div className={styles.traceBody} style={Object.keys(positions).length === 0 ? { gridTemplateColumns: "1fr" } : undefined}>
         {Object.keys(positions).length > 0 && (
           <div className={styles.mapWrap}>
-            {/* eslint-disable-next-line @next/next/no-img-element */}
             <img className={styles.mapImg} src={`${API}/scene-map/${scene}`} alt="scene map" />
             <svg className={styles.mapSvg} viewBox="0 0 100 100" preserveAspectRatio="none">
               {pts.length > 1 && <polyline points={pts.map(([x, y]) => `${x * 100},${y * 100}`).join(" ")} fill="none" stroke="#4c8bf5" strokeWidth={1.1} strokeLinejoin="round" vectorEffect="non-scaling-stroke" />}
@@ -616,7 +794,7 @@ function TraceView({ scene, globalId }: { scene: string; globalId: number }) {
         <div className={styles.timeline}>
           {hops.map((h, i) => (
             <div key={`${h.tracklet_id}-${i}`} className={styles.hop}>
-              {h.crop_url && /* eslint-disable-next-line @next/next/no-img-element */ <img className={styles.hopCrop} src={`${API}${h.crop_url}`} alt={h.camera_id} />}
+              {h.crop_url && <img className={styles.hopCrop} src={`${API}${h.crop_url}`} alt={h.camera_id} />}
               <div className={styles.hopMeta}>
                 <strong>{(h.camera_label ?? h.camera_id).slice(0, 9)}</strong>
                 <span>{fmt(h.ts_start_s)}</span>

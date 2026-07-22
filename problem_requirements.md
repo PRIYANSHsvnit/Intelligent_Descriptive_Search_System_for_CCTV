@@ -9,7 +9,9 @@ Tracking sheet against the Surat Smart City problem statement
 - ✅ Natural-language descriptive search overlay for existing CCTV storage
 - ✅ Retrieve timestamped frames/clips matching attribute or text queries across cameras
 - ✅ Reduce manual footage-review effort (search over 25k+ indexed entities on SUR01)
-- ❌ Forensically sound, exportable outputs for case documentation
+- ✅ Forensically sound, exportable outputs for case documentation
+  — signed portable ZIP with source/derived artifact roles, report, manifest, hashes,
+  server-pinned verification, and an append-only database receipt
 
 ## I. Ingestion & Indexing
 
@@ -18,7 +20,9 @@ Tracking sheet against the Surat Smart City problem statement
   wall-clock timestamps; 22,064 person + 3,285 vehicle tracklets stored
 - ✅ **I.b** Object, person, and vehicle detection with attribute extraction
   — UVH-26 YOLOv11-X (14 Indian vehicle classes) + CrowdHuman person detector;
-  colour via SigLIP zero-shot; clothing/gender/age via Qwen3-VL `vlm_attrs`
+  vehicle colour via SigLIP zero-shot; person clothing/accessories are retrieved from
+  individual multi-view SigLIP vectors. Qwen3-VL is retained only as an optional ablation
+  and is disabled in default ingest.
 - ✅ **I.c** Searchable metadata index over detected entities
   — Postgres + pgvector (HNSW on 1152-d semantic vectors), btree filter index,
   trigram indexes for plates
@@ -26,13 +30,16 @@ Tracking sheet against the Surat Smart City problem statement
 ## II. Descriptive Search
 
 - ✅ **II.a** Natural-language and tag-based queries
-  — `/search?q=` through SigLIP text tower ("red hatchback", "man in yellow
-  t-shirt" work); VLM attribute chips shown on results
-- ⚠️ **II.b** Filter by camera/location, time window, and attribute
-  — scene + entity-type filters work; **no per-camera filter**; time filter is
-  scene-clock seconds only (**no wall-clock "8 PM–10 PM" filter**, though
-  `wall_start`/`wall_end` are stored for every row); frontend exposes only
-  scene + type
+  — `/search?q=` through SigLIP text tower with deterministic component captions,
+  per-crop matching, and exact reranking
+- ✅ **II.b** Filter by camera/location, time window, and attribute
+  — **per-camera/location filter** (typeable Location combobox → `camera_id`,
+  fed by new `/scene-cameras/{scene}`) and a **wall-clock time-of-day** picker
+  (from/to → seconds-since-midnight `t0/t1`, per-camera coverage presets) now live
+  in the frontend console; `/search` gained `camera_id` (+ `color`) params.
+  Person clothing/accessories remain recall-first semantic ranking signals; explicit
+  camera/time/entity filters are authoritative and never silently relaxed. Vehicle
+  colour remains a vehicle-only structured filter.
 - ✅ **II.c** Search by reference image (person/vehicle re-identification)
   — `POST /search/image` (SigLIP image tower) + `GET /search/similar`
   (semantic | reid; reid falls open to semantic on SUR01 — no re-ID vectors stored)
@@ -45,11 +52,17 @@ Tracking sheet against the Surat Smart City problem statement
 - ⚠️ **III.b** Cross-camera tracking of the same target
   — full matcher + trace UI on the CityFlow bench (IDF1 0.417); on SUR01 only
   plate-based stitching (12 global-id groups) — cameras are non-overlapping
-- ❌ **III.c** Export of matching clips, annotated images, and reports
+- ✅ **III.c** Export of matching clips, annotated images, and reports
+  — result player generates a case ZIP containing indexed source media, a padded selected
+  clip, full-frame box annotation, and a PDF summary
 
 ## IV. Forensic Output
 
-- ❌ **IV.a** Chain-of-custody metadata and integrity hashing on exports
+- ✅ **IV.a** Chain-of-custody metadata and integrity hashing on exports
+  — `manifest.json` records case/officer/query/filter/camera/time/model/retrieval/crop
+  provenance and artifact roles; `SHA256SUMS` covers all evidence and metadata artifacts;
+  Ed25519 signs the checksum file; UI/CLI verification pins the deployment public key;
+  `forensic_exports` keeps an append-only server receipt
 - ❌ **IV.b** Search-history and audit logging
 
 ## Bonus Points
@@ -64,23 +77,33 @@ Tracking sheet against the Surat Smart City problem statement
   `/search?plate=`; plate-based tracklet stitching
 - ❌ Face-recognition integration ("where permitted" — deliberately skipped)
 - ❌ Live-feed snapshot scanning (pipeline is offline/batch)
-- ❌ Lightweight models for edge/field deployment (pipeline is GPU-first by design)
+- ⚠️ Lightweight models for edge/field deployment
+  — default ingest excludes the 4B VLM and measured SigLIP peak allocation is ~2.63 GiB;
+  live-tier throughput still varies by camera density and needs the stride-2 quality bench
 
 ## Deliverables
 
 - ✅ Working prototype/demo on sample CCTV footage — end-to-end on real Surat
   footage (SUR01)
-- ⚠️ Descriptive-search dashboard with worked queries — dashboard live; the
-  statement's own worked queries need the II.b time/camera filters to be typeable
-- ❌ Sample forensic export with metadata
-- ❌ Documentation (models, indexing, integrity controls) — deferred to the end
+- ✅ Descriptive-search dashboard with worked queries — forensic-console dashboard
+  live (unified plate/description search, Location + Time filters, results grid,
+  clip player w/ box overlay); II.b filters are now typeable
+- ✅ Sample forensic export with metadata — generated from SUR01 and verified end-to-end
+- ✅ Documentation (models, indexing, integrity controls)
+  — model/index/retrieval design plus forensic trust model, package layout, key handling,
+  verification, and tamper-demo procedure are documented
 
 ## Some More things to Fix
-- 1. HNSW recall — likely a real, free win. schema.sql builds the index with defaults, and the backend never sets hnsw.ef_search, so every query runs at pgvector's default of 40 candidates. That was fine at 1,233 CityFlow rows, but a full SUR01 ingest is ~24k+ tracklets — at that scale ef_search=40 will genuinely drop true neighbors, and it manifests exactly as "the search missed a clip that's obviously there." Honestly, at 30k rows × 1152 dims you can afford to skip the ANN index entirely and brute-force scan (tens of ms) for guaranteed 100% recall, or just SET LOCAL hnsw.ef_search = 200 per query. Your memory already flags ef_search as an open item — this is it coming due.
+- ✅ 1. HNSW recall — DONE. `backend config.HNSW_EF_SEARCH` (default 200, env-overridable)
+  is applied per query via `SET hnsw.ef_search` in `engine._connect()`, lifting recall
+  above pgvector's default 40 candidates (which drops true neighbors at SUR01's ~25k rows).
+  `schema.sql` documents that recall is controlled at query time. Set 0 to disable.
 
-- K_CROPS = 3 + mean-pooling — the semantic-vector knob. Each tracklet's search vector is the mean of only its 3 "best" crops, where best = area × Laplacian sharpness (detect_track.py:54). Two things to consider:
-    Raising K to ~5–7 adds viewpoint diversity to the mean cheaply (siglip pass is batched; cost is linear and offline). The area×sharpness metric also biases toward the closest-to-camera frame, which for fast vehicles is often the motion-blurred or most-occluded one — worth eyeballing what it picks.
-    The bigger structural option: mean-pooling blurs away single-view attributes. A query like "text on the back of a truck" or "bag on left shoulder" matches one crop strongly and the mean weakly. Storing per-crop vectors and taking max-similarity per tracklet at query time is the highest-ceiling retrieval change available — but it's a schema/search rework (N rows per tracklet), so I'd file it, not rush it.
+- ✅ 2. Multi-view crop retrieval — DONE. `tracklet_crops` stores each retained SigLIP
+  vector; HNSW retrieves a broad crop pool and exact reranking supports legacy mean,
+  max, and best-two aggregation. SUR01 has 73,976 backfilled crop vectors. New detections
+  select five crops from quality winners plus temporal samples and support configurable
+  person-box expansion. Human relevance labelling remains the accuracy release gate.
     
 - ✅ Prompt-template the text query. DONE via the same `query_rewrite.py` Groq hook:
   every query is rewritten to caption style ("man red shirt" → "a man in a red

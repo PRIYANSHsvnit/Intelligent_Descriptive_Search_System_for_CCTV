@@ -1,8 +1,11 @@
 """Phase-1 ingest orchestrator for a scene.
 
 Runs stage-major (all cams through one stage before the next) so each GPU model is
-loaded/freed once per pass, per the VRAM strategy. Stages:
-  detect -> attributes -> media -> siglip -> color -> vlm_attrs -> plate -> reid -> store
+loaded/freed once per pass, per the VRAM strategy. Default stages:
+  detect -> attributes -> media -> siglip -> color -> plate -> reid -> store
+
+The expensive Qwen `vlm_attrs` stage remains available as an explicit ablation:
+  uv run python run_ingest.py --scene SUR01 --stages vlm_attrs store
 
 Usage:
   uv run python run_ingest.py --scene S01
@@ -36,13 +39,10 @@ from pipeline import (  # noqa: E402
 
 ALL_STAGES = ["detect", "attributes", "media", "siglip", "color",
               "vlm_attrs", "plate", "reid", "store"]
-# `vlm_attrs` = Qwen3-VL-4B via llama.cpp: structured person attributes with "unknown"
-# allowed, so unreadable crops abstain instead of mislabeling (validated on SUR01/c004 —
-# see plan.md "Person attributes" / the qwen3vl-person-attrs memory). It is the SOLE
-# source of person_attrs, outfit colors included (the region-split SigLIP color stage
-# was removed: fixed crop fractions blended bystanders into wrong labels and never
-# abstained, so its mislabels outranked better VLM answers).
-DEFAULT_STAGES = list(ALL_STAGES)
+# Qwen3-VL is intentionally not in the default path: its measured latency and incomplete
+# attribute coverage do not justify delaying the lightweight searchable index. Keep the
+# stage runnable explicitly for ablations; it remains the sole writer of person_attrs.
+DEFAULT_STAGES = [stage for stage in ALL_STAGES if stage != "vlm_attrs"]
 
 
 def main() -> int:
@@ -79,9 +79,9 @@ def main() -> int:
         each("color", lambda c: color_siglip.run(args.scene, c))
     if "vlm_attrs" in args.stages:
         each("vlm_attrs", lambda c: vlm_attrs.run(args.scene, c))
+        vlm_attrs.shutdown()      # explicit runs must release ~4.7 GB before later stages
     if "plate" in args.stages:
         each("plate", lambda c: plate.run(args.scene, c))
-        vlm_attrs.shutdown()      # free the ~4.7 GB of VRAM before the next GPU stage
     if "reid" in args.stages:
         each("reid", lambda c: embed_reid.run(args.scene, c))
     if "store" in args.stages:

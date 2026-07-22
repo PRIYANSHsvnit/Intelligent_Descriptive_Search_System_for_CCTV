@@ -7,6 +7,7 @@ regardless of which entry point ran.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -29,6 +30,12 @@ __all__ = [
     "SEMANTIC_DIM",
     "SIGLIP_MODEL",
     "K_CROPS",
+    "CROP_TEMPORAL_SAMPLES",
+    "CROP_MIN_FRAME_GAP",
+    "CROP_DUPLICATE_CORRELATION",
+    "PERSON_CROP_PAD_X",
+    "PERSON_CROP_PAD_TOP",
+    "PERSON_CROP_PAD_BOTTOM",
     "COLOR_HS_BINS",
     "COLOR_V_BINS",
     "COLOR_VOCAB",
@@ -42,7 +49,23 @@ __all__ = [
 ]
 
 # --- crop selection ----------------------------------------------------------
-K_CROPS = 3
+# Top-K best crops per tracklet (quality = area x Laplacian sharpness, best-first).
+# The SigLIP SEARCH vector is the MEAN of these K, so more crops add viewpoint
+# diversity to the mean cheaply (cost is linear + offline). The VLM stage caps
+# itself at VLM_MAX_CROPS so its 6 GB context budget is unaffected by raising this.
+# Takes effect on the next (re-)ingest; existing rows keep their 3-crop means.
+K_CROPS = 5
+# In addition to the K quality winners, retain a tiny uniform reservoir while the
+# track is active. Final selection draws early/middle/late views from their union.
+CROP_TEMPORAL_SAMPLES = int(os.environ.get("CROP_TEMPORAL_SAMPLES", "3"))
+CROP_MIN_FRAME_GAP = int(os.environ.get("CROP_MIN_FRAME_GAP", "5"))
+CROP_DUPLICATE_CORRELATION = float(os.environ.get("CROP_DUPLICATE_CORRELATION", "0.985"))
+
+# Person-only crop expansion experiment. Raw boxes in detections.npy never change.
+# Fractions are relative to the detected width/height and remain env-overridable.
+PERSON_CROP_PAD_X = float(os.environ.get("PERSON_CROP_PAD_X", "0.05"))
+PERSON_CROP_PAD_TOP = float(os.environ.get("PERSON_CROP_PAD_TOP", "0.05"))
+PERSON_CROP_PAD_BOTTOM = float(os.environ.get("PERSON_CROP_PAD_BOTTOM", "0.02"))
 
 # --- HSV color signature (56-dim): 12x4 Hue x Sat (48) + 8 Value (8) ---------
 COLOR_HS_BINS = (12, 4)

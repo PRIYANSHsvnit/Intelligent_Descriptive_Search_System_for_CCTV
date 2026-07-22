@@ -139,6 +139,30 @@ Useful backend endpoints:
 - Swagger UI: `http://localhost:8000/docs`
 - ReDoc: `http://localhost:8000/redoc`
 
+## Retrieval architecture
+
+The production search path uses individual SigLIP2 vectors for each retained tracklet
+view, broad HNSW candidate retrieval, exact crop reranking, and deterministic component
+prompts for descriptions such as “yellow shirt and black cap.” Explicit camera, time,
+entity, and vehicle-colour filters are never silently removed.
+
+See [`improvement-plan.md`](./improvement-plan.md) for the implemented design, evaluation
+protocol, measured latency, and remaining human-labelling gate.
+
+## Forensic evidence export
+
+Open a search result, choose **Export evidence**, and enter a case ID plus officer/badge ID.
+The backend creates a ZIP with the unannotated indexed source recording, a selected clip,
+an annotated frame, a PDF report, a JSON manifest, SHA-256 checksums, and an Ed25519
+signature. **Verify export** in the top bar checks an uploaded package against this
+deployment's trusted signing key and reports `VALID` or `TAMPERED`.
+
+Generated packages and private keys are ignored by Git. Back up
+`apps/backend_py/.forensic_keys/ed25519-private.pem` securely: losing or replacing it
+breaks continuity of signer identity. See
+[`docs/forensic-export.md`](./docs/forensic-export.md) for the package format, CLI verifier,
+trust model, database migration, and safe tamper demo.
+
 ### Backend environment variables (`.env`)
 
 If you need environment variables for the API:

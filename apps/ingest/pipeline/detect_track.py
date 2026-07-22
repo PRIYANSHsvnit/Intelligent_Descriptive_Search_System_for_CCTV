@@ -5,7 +5,7 @@ Runs on GPU. ONE decode pass: each frame is read once and handed to both detecto
 namespace. Persists, per camera:
   - detections.npy : every per-frame box (for the evaluator's IoU→GT match, full fps,
                      INCLUDING boxes of tracks later dropped as noise)
-  - crops/         : the K=3 best thumbnails per tracklet (area × sharpness)
+  - crops/         : K quality + temporally diverse thumbnails per tracklet
   - tracklets.json : per-tracklet metadata (subtype vote, time, crop files, ...) —
                      tracks under MIN_TRACK_DETECTIONS are dropped HERE, so no
                      downstream stage (SigLIP/VLM/plate/...) ever pays for noise
@@ -17,13 +17,22 @@ from __future__ import annotations
 
 import heapq
 import json
+import random
 
 import cv2
 import numpy as np
 from ultralytics import YOLO
 
 from . import paths, profiles
-from .cfg import K_CROPS
+from .cfg import (
+    CROP_DUPLICATE_CORRELATION,
+    CROP_MIN_FRAME_GAP,
+    CROP_TEMPORAL_SAMPLES,
+    K_CROPS,
+    PERSON_CROP_PAD_BOTTOM,
+    PERSON_CROP_PAD_TOP,
+    PERSON_CROP_PAD_X,
+)
 
 
 def _laplacian_var(crop_bgr: np.ndarray) -> float:
@@ -34,17 +43,21 @@ def _laplacian_var(crop_bgr: np.ndarray) -> float:
 
 
 class _TrackAcc:
-    """Accumulates one track's detections + a min-heap of its K best crops."""
+    """Accumulates detections plus quality and uniform temporal crop candidates."""
 
-    __slots__ = ("tid", "frames", "confs", "clses", "heap", "_seq")
+    __slots__ = ("tid", "frames", "confs", "clses", "heap", "samples", "_seq", "_rng")
 
     def __init__(self, tid: int):
         self.tid = tid
         self.frames: list[int] = []
         self.confs: list[float] = []
         self.clses: list[int] = []
-        self.heap: list[tuple[float, int, np.ndarray]] = []  # (quality, seq, crop)
+        # (quality, seq, frame, crop); K global quality winners.
+        self.heap: list[tuple[float, int, int, np.ndarray]] = []
+        # (seq, frame, quality, crop); small uniform reservoir preserves other moments.
+        self.samples: list[tuple[int, int, float, np.ndarray]] = []
         self._seq = 0
+        self._rng = random.Random(tid)
 
     def add(self, frame: int, conf: float, cls: int, crop_bgr: np.ndarray) -> None:
         self.frames.append(frame)
@@ -53,16 +66,96 @@ class _TrackAcc:
         h, w = crop_bgr.shape[:2]
         quality = (h * w) * _laplacian_var(crop_bgr)
         self._seq += 1
-        # .copy() only on actual insert (crop_bgr is a view into the frame — storing it
-        # uncopied would pin whole frames in memory); most boxes lose and need no copy.
+        heap_insert = len(self.heap) < K_CROPS or quality > self.heap[0][0]
+        sample_slot = None
+        if CROP_TEMPORAL_SAMPLES > 0:
+            if len(self.samples) < CROP_TEMPORAL_SAMPLES:
+                sample_slot = len(self.samples)
+            else:
+                j = self._rng.randrange(self._seq)
+                if j < CROP_TEMPORAL_SAMPLES:
+                    sample_slot = j
+        # Copy only when at least one reservoir accepts the frame. Both reservoirs share
+        # the same ndarray object when they select it, avoiding duplicate image storage.
+        crop_copy = crop_bgr.copy() if heap_insert or sample_slot is not None else None
         if len(self.heap) < K_CROPS:
-            heapq.heappush(self.heap, (quality, self._seq, crop_bgr.copy()))
+            heapq.heappush(self.heap, (quality, self._seq, frame, crop_copy))
         elif quality > self.heap[0][0]:
-            heapq.heapreplace(self.heap, (quality, self._seq, crop_bgr.copy()))
+            heapq.heapreplace(self.heap, (quality, self._seq, frame, crop_copy))
+        if sample_slot is not None:
+            item = (self._seq, frame, quality, crop_copy)
+            if sample_slot == len(self.samples):
+                self.samples.append(item)
+            else:
+                self.samples[sample_slot] = item
+
+    @staticmethod
+    def _correlation(a: np.ndarray, b: np.ndarray) -> float:
+        """Cheap appearance duplicate score; only used for temporally close candidates."""
+        def thumb(x):
+            g = cv2.cvtColor(x, cv2.COLOR_BGR2GRAY)
+            return cv2.resize(g, (24, 32), interpolation=cv2.INTER_AREA).astype(np.float32)
+        aa, bb = thumb(a).ravel(), thumb(b).ravel()
+        aa -= aa.mean()
+        bb -= bb.mean()
+        denom = float(np.linalg.norm(aa) * np.linalg.norm(bb))
+        return float(aa @ bb / denom) if denom > 1e-6 else 1.0
+
+    def best_crop_records(self) -> list[dict]:
+        """Select K views: early/middle/late anchors, then diverse quality winners."""
+        candidates = {
+            seq: {"quality": quality, "seq": seq, "frame_no": frame, "crop": crop}
+            for quality, seq, frame, crop in self.heap
+        }
+        for seq, frame, quality, crop in self.samples:
+            candidates.setdefault(
+                seq, {"quality": quality, "seq": seq, "frame_no": frame, "crop": crop})
+        pool = list(candidates.values())
+        if not pool:
+            return []
+
+        selected: list[dict] = []
+        selected_seq: set[int] = set()
+        f0, f1 = min(self.frames), max(self.frames)
+        span = max(1, f1 - f0 + 1)
+        for third in range(3):
+            lo = f0 + span * third / 3
+            hi = f0 + span * (third + 1) / 3
+            bucket = [c for c in pool if lo <= c["frame_no"] < hi or
+                      (third == 2 and c["frame_no"] == f1)]
+            if bucket:
+                winner = max(bucket, key=lambda c: c["quality"])
+                if winner["seq"] not in selected_seq:
+                    selected.append(winner)
+                    selected_seq.add(winner["seq"])
+
+        def redundant(candidate: dict) -> bool:
+            return any(
+                abs(candidate["frame_no"] - kept["frame_no"]) < CROP_MIN_FRAME_GAP
+                and self._correlation(candidate["crop"], kept["crop"])
+                >= CROP_DUPLICATE_CORRELATION
+                for kept in selected
+            )
+
+        ranked = sorted(pool, key=lambda c: c["quality"], reverse=True)
+        for candidate in ranked:
+            if len(selected) >= K_CROPS:
+                break
+            if candidate["seq"] not in selected_seq and not redundant(candidate):
+                selected.append(candidate)
+                selected_seq.add(candidate["seq"])
+        # Very short/static tracks may not have K diverse candidates; fill rather than
+        # returning fewer useful views.
+        for candidate in ranked:
+            if len(selected) >= K_CROPS:
+                break
+            if candidate["seq"] not in selected_seq:
+                selected.append(candidate)
+                selected_seq.add(candidate["seq"])
+        return sorted(selected[:K_CROPS], key=lambda c: c["quality"], reverse=True)
 
     def best_crops(self) -> list[np.ndarray]:
-        # heap is a min-heap on quality; return best-first
-        return [c for _, _, c in sorted(self.heap, key=lambda t: t[0], reverse=True)]
+        return [r["crop"] for r in self.best_crop_records()]
 
 
 # Sentinel class id for person dets in detections.npy — COCO 'person' is id 0, which
@@ -109,6 +202,12 @@ def _accumulate(tracks, detections, frame_idx, tid, box, conf, cls, img, W, H) -
     if xi2 <= xi1 or yi2 <= yi1:
         return
     detections.append((frame_idx, tid, x1, y1, x2, y2, float(conf), cls))
+    if cls == PERSON_CLS:
+        bw, bh = xi2 - xi1, yi2 - yi1
+        xi1 = max(0, int(xi1 - bw * PERSON_CROP_PAD_X))
+        xi2 = min(W, int(xi2 + bw * PERSON_CROP_PAD_X))
+        yi1 = max(0, int(yi1 - bh * PERSON_CROP_PAD_TOP))
+        yi2 = min(H, int(yi2 + bh * PERSON_CROP_PAD_BOTTOM))
     acc = tracks.get(tid)
     if acc is None:
         acc = tracks[tid] = _TrackAcc(tid)
@@ -203,10 +302,18 @@ def run(scene: str, cam: str, max_frames: int | None = None, device: int = 0) ->
             f_start, f_end = min(acc.frames), max(acc.frames)
             ts_start, ts_end = offset + f_start / fps, offset + f_end / fps
             crop_files = []
-            for k, crop in enumerate(acc.best_crops()):
+            crop_meta = []
+            for k, record in enumerate(acc.best_crop_records()):
+                crop = record["crop"]
                 fn = f"{prefix}{tid}_{k}.jpg"
                 cv2.imwrite(str(crops_dir / fn), crop)
-                crop_files.append(paths.rel_key(crops_dir / fn))
+                ref = paths.rel_key(crops_dir / fn)
+                crop_files.append(ref)
+                crop_meta.append({
+                    "ref": ref,
+                    "frame_no": int(record["frame_no"]),
+                    "quality": float(record["quality"]),
+                })
             rows.append({
                 "tracklet_id": f"{scene}_{cam}_{prefix}{tid}",
                 "scene": scene,
@@ -223,6 +330,7 @@ def run(scene: str, cam: str, max_frames: int | None = None, device: int = 0) ->
                 "wall_start": paths.wall_time(ts_start).isoformat(),
                 "wall_end": paths.wall_time(ts_end).isoformat(),
                 "crop_refs": crop_files,
+                "crop_meta": crop_meta,
             })
         return rows
 

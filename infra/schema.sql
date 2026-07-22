@@ -68,10 +68,63 @@ CREATE TABLE IF NOT EXISTS cameras (
 -- rows (flat scan is fine) — created here for when the table grows.
 -- No index on reid_* — cross-camera matching is an offline batch job (which also
 -- frees reid_appearance from pgvector's 2000-dim index cap).
+-- NOTE recall: pgvector's hnsw.ef_search defaults to 40 candidates, which drops true
+-- neighbors once the table reaches ~25k rows. The backend raises it per query
+-- (SET hnsw.ef_search, default 200 — see backend config.HNSW_EF_SEARCH), so recall is
+-- controlled at query time rather than by the index build here.
 CREATE INDEX IF NOT EXISTS tracklets_semantic_hnsw
   ON tracklets USING hnsw (semantic_vector vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS tracklets_filter
   ON tracklets (scene, camera_id, entity_type, color);
+
+-- One semantic vector per retained view. `tracklets.semantic_vector` remains as a
+-- compatibility/fallback mean, while descriptive retrieval ranks each tracklet from
+-- its individual crop scores (normally the mean of its best two query matches).
+CREATE TABLE IF NOT EXISTS tracklet_crops (
+  tracklet_id      TEXT NOT NULL REFERENCES tracklets(tracklet_id) ON DELETE CASCADE,
+  crop_index       SMALLINT NOT NULL,
+  frame_no         INT,
+  crop_ref         TEXT NOT NULL,
+  quality          REAL,
+  semantic_vector  vector(1152) NOT NULL,
+  PRIMARY KEY (tracklet_id, crop_index)
+);
+
+CREATE INDEX IF NOT EXISTS tracklet_crops_tracklet
+  ON tracklet_crops (tracklet_id);
+CREATE INDEX IF NOT EXISTS tracklet_crops_semantic_hnsw
+  ON tracklet_crops USING hnsw (semantic_vector vector_cosine_ops);
+
+-- Immutable receipt for every generated forensic package. The ZIP remains portable;
+-- this row is the server-side chain-of-custody anchor used to identify its signer and
+-- the manifest originally emitted by this deployment.
+CREATE TABLE IF NOT EXISTS forensic_exports (
+  export_id         UUID PRIMARY KEY,
+  case_id           TEXT NOT NULL,
+  officer           TEXT NOT NULL,
+  tracklet_id       TEXT NOT NULL REFERENCES tracklets(tracklet_id),
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  package_path      TEXT NOT NULL,
+  manifest_sha256   TEXT NOT NULL,
+  source_sha256     TEXT NOT NULL,
+  signing_key_id    TEXT NOT NULL,
+  metadata          JSONB NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS forensic_exports_case_created
+  ON forensic_exports (case_id, created_at DESC);
+
+CREATE OR REPLACE FUNCTION reject_forensic_export_mutation()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE EXCEPTION 'forensic export receipts are append-only';
+END;
+$$;
+
+DROP TRIGGER IF EXISTS forensic_exports_append_only ON forensic_exports;
+CREATE TRIGGER forensic_exports_append_only
+BEFORE UPDATE OR DELETE ON forensic_exports
+FOR EACH ROW EXECUTE FUNCTION reject_forensic_export_mutation();
 
 -- Additive column for DBs created before the plate stage (CREATE TABLE IF NOT
 -- EXISTS won't add it); harmless no-op on fresh DBs.

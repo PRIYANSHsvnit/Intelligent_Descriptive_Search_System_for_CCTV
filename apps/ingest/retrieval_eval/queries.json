@@ -1,0 +1,17 @@
+[
+  {"id": "veh_white_suv", "group": "vehicle", "query": "white SUV", "scene": "SUR01", "type": "vehicle"},
+  {"id": "veh_red_hatch", "group": "vehicle", "query": "red hatchback", "scene": "SUR01", "type": "vehicle"},
+  {"id": "veh_yellow_auto", "group": "vehicle", "query": "yellow auto-rickshaw", "scene": "SUR01", "type": "vehicle"},
+  {"id": "veh_black_bike", "group": "vehicle", "query": "black motorcycle", "scene": "SUR01", "type": "vehicle"},
+  {"id": "person_backpack", "group": "person-single", "query": "person carrying a backpack", "scene": "SUR01", "type": "person"},
+  {"id": "person_helmet", "group": "person-single", "query": "person wearing a helmet", "scene": "SUR01", "type": "person"},
+  {"id": "person_cap", "group": "person-single", "query": "person wearing a black cap", "scene": "SUR01", "type": "person"},
+  {"id": "person_turban", "group": "person-rare", "query": "person wearing a turban", "scene": "SUR01", "type": "person"},
+  {"id": "person_yellow_top", "group": "person-clothing", "query": "person wearing a yellow shirt", "scene": "SUR01", "type": "person"},
+  {"id": "person_pink_top", "group": "person-clothing", "query": "person wearing a pink shirt", "scene": "SUR01", "type": "person"},
+  {"id": "person_white_black", "group": "person-composite", "query": "person in a white shirt and black trousers", "scene": "SUR01", "type": "person"},
+  {"id": "man_red_top", "group": "person-composite", "query": "man in a red shirt", "scene": "SUR01", "type": "person"},
+  {"id": "woman_black_top", "group": "person-composite", "query": "woman in a black top", "scene": "SUR01", "type": "person"},
+  {"id": "man_cap_bag", "group": "person-composite", "query": "man wearing a cap with a backpack", "scene": "SUR01", "type": "person"},
+  {"id": "rider_no_helmet", "group": "negation", "query": "rider without helmet", "scene": "SUR01", "type": "person"}
+]

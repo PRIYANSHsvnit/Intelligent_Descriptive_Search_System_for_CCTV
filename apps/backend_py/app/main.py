@@ -16,15 +16,28 @@ Auth (hackathon posture): none — one shared local DB. Don't build accounts.
 from __future__ import annotations
 
 import io
+import tempfile
 from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
+from pydantic import BaseModel, Field
 
-from . import boxes, config, engine
+from . import boxes, config, engine, forensics
+
+
+class ForensicExportRequest(BaseModel):
+    tracklet_id: str = Field(min_length=1, max_length=200)
+    case_id: str = Field(min_length=1, max_length=120)
+    officer: str = Field(min_length=1, max_length=120)
+    selected_crop_ref: str | None = Field(default=None, max_length=500)
+    search: dict[str, Any] = Field(default_factory=dict)
+    retrieval: dict[str, Any] = Field(default_factory=dict)
 
 
 @asynccontextmanager
@@ -39,6 +52,7 @@ app.add_middleware(
     allow_origins=["*"],  # hackathon: frontend on :3000 → backend on :8000
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition", "X-Forensic-Export-ID", "X-Forensic-Key-ID"],
 )
 
 # crop thumbnails (StaticFiles supports range too); created lazily by ingest
@@ -62,13 +76,21 @@ def search(
     color: str | None = Query(None, description="filter by stored colour name (vehicle-level)"),
     t0: float | None = None,
     t1: float | None = None,
+    aggregation: str | None = Query(
+        None, pattern="^(legacy_mean|mean|best_single|max|top2_mean)$"),
+    compositional: bool = True,
+    composition: str | None = Query(None, pattern="^(weighted|soft_and)$"),
     limit: int = Query(20, ge=1, le=100),
 ):
     if plate:
         return engine.search_plate(plate, scene, limit, camera_id=camera_id)
     if not q:
         raise HTTPException(422, "provide q (description) or plate")
-    return engine.search(q, type, scene, t0, t1, limit, camera_id=camera_id, color=color)
+    if type == "person" and color:
+        raise HTTPException(422, "color is vehicle-level; describe person clothing in q")
+    return engine.search(q, type, scene, t0, t1, limit, camera_id=camera_id, color=color,
+                         aggregation=aggregation, compositional=compositional,
+                         composition=composition)
 
 
 @app.get("/scene-cameras/{scene}")
@@ -86,10 +108,16 @@ async def search_image(
     color: str | None = Form(None),
     t0: float | None = Form(None),
     t1: float | None = Form(None),
+    aggregation: str | None = Form(None),
     limit: int = Form(20),
 ):
     if type and type not in ("vehicle", "person"):
         raise HTTPException(422, "type must be 'vehicle' or 'person'")
+    if type == "person" and color:
+        raise HTTPException(422, "color is vehicle-level; person clothing is semantic")
+    if aggregation and aggregation not in (
+            "legacy_mean", "mean", "best_single", "max", "top2_mean"):
+        raise HTTPException(422, "invalid aggregation")
     data = await image.read()
     try:
         img = Image.open(io.BytesIO(data))
@@ -98,7 +126,8 @@ async def search_image(
         raise HTTPException(422, "could not decode image")
     return engine.search_image(img, type or None, scene or None, t0, t1,
                                min(max(limit, 1), 100),
-                               camera_id=camera_id or None, color=color or None)
+                               camera_id=camera_id or None, color=color or None,
+                               aggregation=aggregation or None)
 
 
 @app.get("/search/similar")
@@ -142,3 +171,48 @@ def scene_map(scene: str):
     if not path.exists():
         raise HTTPException(404, f"no map for {scene}")
     return FileResponse(str(path), media_type="image/png")
+
+
+@app.post("/forensics/export")
+def forensic_export(request: ForensicExportRequest):
+    """Build a signed ZIP containing source evidence and explicitly derived artifacts."""
+    try:
+        result = forensics.create_export(request.model_dump())
+    except forensics.ForensicExportError as exc:
+        status = 404 if "tracklet does not exist" in str(exc) else 422
+        raise HTTPException(status, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(500, "forensic export failed; no package was recorded") from exc
+    return FileResponse(
+        str(result.package_path),
+        media_type="application/zip",
+        filename=result.package_path.name,
+        headers={
+            "X-Forensic-Export-ID": result.export_id,
+            "X-Forensic-Key-ID": result.signing_key_id,
+        },
+    )
+
+
+@app.post("/forensics/verify")
+def forensic_verify(package: UploadFile = File(..., description="forensic export ZIP")):
+    """Verify hashes and signature against this deployment's trusted public key."""
+    suffix = Path(package.filename or "package.zip").suffix
+    if suffix.lower() != ".zip":
+        raise HTTPException(422, "verification requires a ZIP package")
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix="forensic-verify-", suffix=".zip",
+                                         delete=False) as temp:
+            temp_path = Path(temp.name)
+            total = 0
+            while chunk := package.file.read(1024 * 1024):
+                total += len(chunk)
+                if total > 8 * 1024 * 1024 * 1024:
+                    raise HTTPException(413, "package exceeds the 8 GiB verification limit")
+                temp.write(chunk)
+        _, public_key = forensics.ensure_signing_key()
+        return forensics.verify_package(temp_path, trusted_public_key=public_key)
+    finally:
+        if temp_path:
+            temp_path.unlink(missing_ok=True)

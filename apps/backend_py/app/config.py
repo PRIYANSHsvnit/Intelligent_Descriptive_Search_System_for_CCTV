@@ -22,6 +22,43 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 # where the ingest pipeline wrote crops + per-camera MP4s (relative keys resolve here)
 OUTPUT_ROOT = Path(os.environ.get("INGEST_OUTPUT_ROOT", REPO_ROOT / "apps" / "ingest" / "output"))
 
+# Forensic exports are kept outside ingest output: ingest artifacts are evidence inputs,
+# while packages are derived case outputs. The private Ed25519 key is generated lazily,
+# mode 0600, and must be replaced with managed key material in a real deployment.
+FORENSIC_EXPORT_ROOT = Path(os.environ.get(
+    "FORENSIC_EXPORT_ROOT", REPO_ROOT / "apps" / "backend_py" / "forensic_exports"))
+FORENSIC_KEY_DIR = Path(os.environ.get(
+    "FORENSIC_KEY_DIR", REPO_ROOT / "apps" / "backend_py" / ".forensic_keys"))
+FORENSIC_CLIP_PADDING_S = float(os.environ.get("FORENSIC_CLIP_PADDING_S", "2.0"))
+
+# Model inventory recorded in every export. Scene-specific detector selection mirrors the
+# ingest profiles; environment overrides support a deployment with different checkpoints.
+SIGLIP_REVISION = os.environ.get("SIGLIP_REVISION", "main (unpinned prototype)")
+INDIA_VEHICLE_DETECTOR = os.environ.get(
+    "INDIA_VEHICLE_DETECTOR", "IISc UVH-26 YOLOv11-X")
+INDIA_PERSON_DETECTOR = os.environ.get(
+    "INDIA_PERSON_DETECTOR", "CrowdHuman YOLOv8n")
+CITYFLOW_DETECTOR = os.environ.get("CITYFLOW_DETECTOR", "Ultralytics YOLO11m COCO")
+TRACKER_MODEL = os.environ.get("TRACKER_MODEL", "BoT-SORT")
+
+
+def forensic_model_inventory(scene: str) -> dict:
+    detectors = (
+        {"vehicle": INDIA_VEHICLE_DETECTOR, "person": INDIA_PERSON_DETECTOR}
+        if scene.upper().startswith("SUR") or "surat" in scene.lower()
+        else {"vehicle_and_person": CITYFLOW_DETECTOR}
+    )
+    return {
+        "semantic_encoder": {
+            "id": SIGLIP_MODEL,
+            "revision": SIGLIP_REVISION,
+            "embedding_dimension": SEMANTIC_DIM,
+        },
+        "detectors": detectors,
+        "tracker": TRACKER_MODEL,
+        "attribute_vlm": {"enabled": False, "role": "not used for retrieval"},
+    }
+
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://cctv:cctv@localhost:5432/cctv")
 
 # Scene location maps (cam_loc/*.png). S03/S04/S05 share one map (S0345.png).
@@ -73,3 +110,21 @@ def camera_offset(scene: str, camera_id: str) -> float:
 
 # SigLIP text encoder device: CPU is plenty for one short query per search.
 DEVICE = os.environ.get("SEARCH_DEVICE", "cpu")
+
+# HNSW recall knob. pgvector's hnsw.ef_search defaults to 40 candidates — fine at a
+# few thousand rows, but at SUR01's ~25k tracklets it drops true neighbors (manifests
+# as "the obviously-matching clip is missing"). We raise it per query in engine._connect().
+# 200 is a safe recall/latency trade at this scale (still single-digit ms); set 0 to disable.
+HNSW_EF_SEARCH = int(os.environ.get("HNSW_EF_SEARCH", "200"))
+
+# Multi-view retrieval. ANN finds a broad crop pool; exact cosine scoring and
+# per-tracklet aggregation happen in Python so the final ordering is deterministic.
+CROP_CANDIDATES_PER_PROMPT = int(os.environ.get("CROP_CANDIDATES_PER_PROMPT", "750"))
+CROP_AGGREGATION = os.environ.get("CROP_AGGREGATION", "top2_mean")
+COMPOSITION_MODE = os.environ.get("COMPOSITION_MODE", "weighted")
+EXACT_CROP_SCAN = os.environ.get("EXACT_CROP_SCAN", "0").lower() in ("1", "true", "yes")
+
+# Conservative presentation-only fragment grouping. Simultaneous objects are never
+# merged; nearby non-overlapping fragments need very high semantic similarity.
+DEDUP_MAX_GAP_S = float(os.environ.get("DEDUP_MAX_GAP_S", "2.0"))
+DEDUP_MIN_SIM = float(os.environ.get("DEDUP_MIN_SIM", "0.94"))

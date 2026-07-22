@@ -1,7 +1,8 @@
 # apps/ingest — offline CV pipeline
 
 Detect → track → crop → attributes → embed → store, per camera. GPU-first
-(YOLO + SigLIP on the RTX 4050); the re-ID pass runs on CPU by design.
+(YOLO + SigLIP on the RTX 4050); the re-ID pass runs on CPU by design. Qwen `vlm_attrs`
+is an optional ablation and is excluded from the default lightweight ingest path.
 
 ## Setup
 
@@ -40,3 +41,28 @@ cd ../../infra && docker compose up -d
 The schema (`infra/schema.sql`) applies automatically on first init. The
 `tracklets` table is one row per tracklet; every not-yet-computed field is
 nullable so people/plates/global_id are additive later.
+
+Descriptive retrieval also uses `tracklet_crops`: one normalized 1152-d SigLIP vector
+per retained view. `tracklets.semantic_vector` remains as the legacy mean fallback.
+
+To backfill crop vectors from existing JPEGs without rerunning detection:
+
+```bash
+uv run python run_ingest.py --profile india --scene SUR01 --stages siglip store
+```
+
+The SigLIP stage streams image decoding one batch at a time. Override `SIGLIP_BATCH`
+only when another GPU service is intentionally co-resident.
+
+## Retrieval evaluation
+
+With the backend running, collect a blind pooled evaluation sheet:
+
+```bash
+uv run python evaluate_retrieval.py --collect
+# teammates fill relevance=0/1 and reviewer in retrieval_eval/judgements.csv
+uv run python evaluate_retrieval.py --score
+```
+
+The pool compares the original normalized mean against crop-level `max` and
+`top2_mean`, both with compositional prompts. Never use model-generated chips as labels.

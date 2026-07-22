@@ -62,7 +62,9 @@ VLM_PARALLEL = int(os.environ.get("VLM_PARALLEL", "4"))   # concurrent slots; 4 
 # crowd is tracker flicker whose crops the VLM answers all-"unknown" on anyway — the
 # tracklet stays stored/searchable (SigLIP vector), it just gets no attribute chips.
 VLM_MIN_DETECTIONS = int(os.environ.get("VLM_MIN_DETECTIONS", "3"))
-VLM_CTX_PER_SLOT = 2048        # per slot: fits K_CROPS images + prompt (default ctx OOMs 6 GB)
+VLM_MAX_CROPS = 3              # images per request, capped independent of K_CROPS: the 6 GB card
+                              # fits ~3 crops + prompt per slot. SigLIP still means all K_CROPS.
+VLM_CTX_PER_SLOT = 2048        # per slot: fits VLM_MAX_CROPS images + prompt (default ctx OOMs 6 GB)
 VLM_CTX = VLM_CTX_PER_SLOT * VLM_PARALLEL   # llama.cpp splits total -c across the -np slots
 VLM_MAX_TOKENS = 120
 VLM_LOAD_TIMEOUT_S = 180       # model load + warmup before /health goes ok
@@ -206,7 +208,9 @@ def run(scene: str, cam: str) -> dict:
     # Resolve each person's crops up front, then fan the requests out across the server's
     # VLM_PARALLEL slots. _ask is pure/thread-safe; the merge below stays single-threaded so
     # the tracklets/counter mutations never race.
-    work = [(i, crops) for i, t in persons
+    # crop_refs are stored best-first, so [:VLM_MAX_CROPS] gives the VLM its best crops
+    # while the SigLIP stage still mean-pools all K_CROPS.
+    work = [(i, crops[:VLM_MAX_CROPS]) for i, t in persons
             if (crops := [str(paths.OUTPUT_ROOT / k) for k in t["crop_refs"]
                           if (paths.OUTPUT_ROOT / k).exists()])]
     with ThreadPoolExecutor(max_workers=VLM_PARALLEL) as ex:

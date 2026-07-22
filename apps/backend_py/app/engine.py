@@ -1,9 +1,9 @@
-"""Search engine: SigLIP text encoder (CPU) + pgvector query with hybrid filters,
-dedup, and fail-open behavior. See plan.md Path B and the API contract."""
+"""Multi-view SigLIP retrieval with exact reranking and authoritative filters."""
 
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 
 import numpy as np
 import psycopg
@@ -11,7 +11,7 @@ import torch
 from pgvector.psycopg import register_vector
 from transformers import AutoModel, AutoProcessor
 
-from . import config, query_rewrite
+from . import config, query_components, query_rewrite
 
 _processor = None
 _model = None
@@ -27,17 +27,22 @@ def load_model() -> None:
     _model = AutoModel.from_pretrained(config.SIGLIP_MODEL).to(config.DEVICE).eval()
 
 
-def encode_text(query: str) -> np.ndarray:
-    """Text → L2-normalized 1152-d vector in the same space as stored image vectors."""
+def encode_texts(queries: list[str]) -> np.ndarray:
+    """Batch text captions into normalized vectors; composition costs one forward pass."""
     inp = _processor(
-        text=[query], padding="max_length", max_length=64, return_tensors="pt"
+        text=queries, padding="max_length", max_length=64, return_tensors="pt"
     ).to(config.DEVICE)
     with torch.no_grad():
         feats = _model.get_text_features(**inp)
         if not isinstance(feats, torch.Tensor):  # transformers 5.x output object
             feats = feats.pooler_output
         feats = torch.nn.functional.normalize(feats, dim=-1)
-    return feats[0].float().cpu().numpy()
+    return feats.float().cpu().numpy()
+
+
+def encode_text(query: str) -> np.ndarray:
+    """Compatibility wrapper for one caption."""
+    return encode_texts([query])[0]
 
 
 def encode_image(img) -> np.ndarray:
@@ -55,78 +60,248 @@ def encode_image(img) -> np.ndarray:
 def _connect() -> psycopg.Connection:
     conn = psycopg.connect(config.DATABASE_URL)
     register_vector(conn)
+    # lift HNSW recall above pgvector's default ef_search=40, which drops true neighbors
+    # at 25k+ rows. Session-scoped SET on this fresh connection; no-op for non-vector queries.
+    if config.HNSW_EF_SEARCH:
+        with conn.cursor() as cur:
+            cur.execute(f"SET hnsw.ef_search = {int(config.HNSW_EF_SEARCH)}")
     return conn
 
 
-_SELECT = """
-    SELECT tracklet_id, scene, camera_id, subtype, color, entity_type,
-           ts_start_s, ts_end_s, crop_refs, video_ref, global_id, person_attrs,
-           plate_text, plate_conf,
-           1 - (semantic_vector <=> %(q)s) AS score
-    FROM tracklets
-    WHERE {where}
-    ORDER BY semantic_vector <=> %(q)s
-    LIMIT %(lim)s
+_RESULT_COLS = """
+    t.tracklet_id, t.scene, t.camera_id, t.subtype, t.color, t.entity_type,
+    t.ts_start_s, t.ts_end_s, t.crop_refs, t.video_ref, t.global_id,
+    t.person_attrs, t.plate_text, t.plate_conf, t.semantic_vector
 """
 
 
-def _run_query(qvec, entity_type, scene, t0, t1, limit, camera_id=None, color=None) -> list[dict]:
-    where = ["semantic_vector IS NOT NULL"]
-    params = {"q": qvec, "lim": limit}
+def _filters(entity_type, scene, t0, t1, camera_id=None, color=None, alias="t"):
+    """Build authoritative SQL filters. None are silently removed later."""
+    where: list[str] = []
+    params: dict = {}
+    p = f"{alias}." if alias else ""
     if entity_type:
-        where.append("entity_type = %(etype)s")
+        where.append(f"{p}entity_type = %(etype)s")
         params["etype"] = entity_type
     if scene:
-        where.append("scene = %(scene)s")
+        where.append(f"{p}scene = %(scene)s")
         params["scene"] = scene
     if camera_id:
-        where.append("camera_id = %(cam)s")
+        where.append(f"{p}camera_id = %(cam)s")
         params["cam"] = camera_id
     if color:
-        where.append("color = %(color)s")
+        where.append(f"{p}color = %(color)s")
         params["color"] = color
-    if t0 is not None and t1 is not None:  # tracklet overlaps [t0, t1]
-        where.append("ts_start_s <= %(t1)s AND ts_end_s >= %(t0)s")
-        params["t0"], params["t1"] = t0, t1
-    sql = _SELECT.format(where=" AND ".join(where))
+    if t0 is not None:
+        where.append(f"{p}ts_end_s >= %(t0)s")
+        params["t0"] = t0
+    if t1 is not None:
+        where.append(f"{p}ts_start_s <= %(t1)s")
+        params["t1"] = t1
+    return where, params
+
+
+def _to_np(value) -> np.ndarray:
+    if hasattr(value, "to_numpy"):
+        return value.to_numpy().astype(np.float32)
+    return np.asarray(list(value), dtype=np.float32)
+
+
+def _aggregate(values: np.ndarray, mode: str) -> float:
+    if not len(values):
+        return float("-inf")
+    ordered = np.sort(values)[::-1]
+    if mode == "max":
+        return float(ordered[0])
+    if mode == "best_single":
+        return float(values[0])
+    if mode == "mean":
+        return float(values.mean())
+    if mode == "top2_mean":
+        return float(ordered[:2].mean())
+    raise ValueError(f"unsupported crop aggregation: {mode}")
+
+
+def _percentiles(values: np.ndarray) -> np.ndarray:
+    """Stable [0,1] rank normalization; prompt modalities need not share a scale."""
+    if len(values) <= 1:
+        return np.ones(len(values), dtype=np.float32)
+    order = np.argsort(values, kind="stable")
+    ranks = np.empty(len(values), dtype=np.float32)
+    ranks[order] = np.arange(len(values), dtype=np.float32)
+    return ranks / float(len(values) - 1)
+
+
+def _mean_query(qvec, entity_type, scene, t0, t1, limit, camera_id=None, color=None):
+    where, params = _filters(entity_type, scene, t0, t1, camera_id, color)
+    where.append("t.semantic_vector IS NOT NULL")
+    params.update({"q": qvec, "lim": limit})
+    sql = f"""
+        SELECT {_RESULT_COLS}, 1 - (t.semantic_vector <=> %(q)s) AS score
+        FROM tracklets t
+        WHERE {' AND '.join(where)}
+        ORDER BY t.semantic_vector <=> %(q)s
+        LIMIT %(lim)s
+    """
     with _connect() as conn, conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
         cur.execute(sql, params)
-        return cur.fetchall()
+        rows = cur.fetchall()
+    for row in rows:
+        row["dedup_vector"] = _to_np(row["semantic_vector"])
+    return rows
+
+
+def _multi_crop_query(qvecs, entity_type, scene, t0, t1, limit, camera_id=None,
+                      color=None, aggregation=None, composition=None):
+    """ANN candidate union -> exact crop scoring -> prompt fusion."""
+    aggregation = aggregation or config.CROP_AGGREGATION
+    composition = composition or config.COMPOSITION_MODE
+    if aggregation not in {"mean", "best_single", "max", "top2_mean"}:
+        raise ValueError(f"unsupported crop aggregation: {aggregation}")
+    if composition not in {"weighted", "soft_and"}:
+        raise ValueError(f"unsupported composition mode: {composition}")
+
+    where, base_params = _filters(entity_type, scene, t0, t1, camera_id, color)
+    candidate_ids: set[str] = set()
+    with _connect() as conn, conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+        cur.execute("SELECT to_regclass('tracklet_crops') AS name")
+        if cur.fetchone()["name"] is None:
+            return None
+        if config.EXACT_CROP_SCAN:
+            sql = f"""
+                SELECT DISTINCT c.tracklet_id
+                FROM tracklet_crops c JOIN tracklets t ON t.tracklet_id=c.tracklet_id
+                {('WHERE ' + ' AND '.join(where)) if where else ''}
+            """
+            cur.execute(sql, base_params)
+            candidate_ids.update(r["tracklet_id"] for r in cur.fetchall())
+        else:
+            crop_where = ["c.semantic_vector IS NOT NULL", *where]
+            sql = f"""
+                SELECT c.tracklet_id
+                FROM tracklet_crops c JOIN tracklets t ON t.tracklet_id=c.tracklet_id
+                WHERE {' AND '.join(crop_where)}
+                ORDER BY c.semantic_vector <=> %(q)s
+                LIMIT %(candidate_limit)s
+            """
+            for qvec in qvecs:
+                params = {**base_params, "q": qvec,
+                          "candidate_limit": config.CROP_CANDIDATES_PER_PROMPT}
+                cur.execute(sql, params)
+                candidate_ids.update(r["tracklet_id"] for r in cur.fetchall())
+        if not candidate_ids:
+            return None
+
+        cur.execute(
+            f"""
+                SELECT {_RESULT_COLS}, c.crop_index, c.crop_ref,
+                       c.semantic_vector AS crop_vector
+                FROM tracklets t JOIN tracklet_crops c ON c.tracklet_id=t.tracklet_id
+                WHERE t.tracklet_id = ANY(%s)
+                ORDER BY t.tracklet_id, c.crop_index
+            """,
+            (sorted(candidate_ids),),
+        )
+        crop_rows = cur.fetchall()
+
+    grouped: dict[str, dict] = {}
+    for row in crop_rows:
+        tid = row["tracklet_id"]
+        group = grouped.setdefault(tid, {"row": dict(row), "vectors": [], "refs": []})
+        group["vectors"].append(_to_np(row["crop_vector"]))
+        group["refs"].append(row["crop_ref"])
+    if not grouped:
+        return None
+
+    ids = list(grouped)
+    per_prompt = np.zeros((len(qvecs), len(ids)), dtype=np.float32)
+    best_full_index = np.zeros(len(ids), dtype=np.int32)
+    for j, tid in enumerate(ids):
+        vectors = np.stack(grouped[tid]["vectors"])
+        mean = vectors.mean(axis=0)
+        grouped[tid]["dedup_vector"] = mean / (np.linalg.norm(mean) + 1e-12)
+        for pi, qvec in enumerate(qvecs):
+            sims = vectors @ qvec
+            per_prompt[pi, j] = _aggregate(sims, aggregation)
+            if pi == 0:
+                best_full_index[j] = int(np.argmax(sims))
+
+    if len(qvecs) == 1:
+        final = per_prompt[0]
+    else:
+        normed = np.stack([_percentiles(scores) for scores in per_prompt])
+        components = normed[1:]
+        if composition == "soft_and":
+            safe = np.clip(components, 1e-4, 1.0)
+            harmonic = len(safe) / np.sum(1.0 / safe, axis=0)
+            final = 0.5 * normed[0] + 0.5 * harmonic
+        else:
+            final = 0.5 * normed[0] + 0.5 * components.mean(axis=0)
+
+    rows = []
+    for j, tid in enumerate(ids):
+        group = grouped[tid]
+        row = group["row"]
+        row["score"] = float(final[j])
+        row["prompt_scores"] = [float(per_prompt[pi, j]) for pi in range(len(qvecs))]
+        row["matched_crop_ref"] = group["refs"][best_full_index[j]]
+        row["dedup_vector"] = group["dedup_vector"]
+        rows.append(row)
+    rows.sort(key=lambda row: row["score"], reverse=True)
+    return rows[:max(limit * 8, 80)]
 
 
 def _overlaps(a: dict, b: dict) -> bool:
     return a["ts_start_s"] <= b["ts_end_s"] and b["ts_start_s"] <= a["ts_end_s"]
 
 
+def _time_gap(a: dict, b: dict) -> float | None:
+    if _overlaps(a, b):
+        return None
+    if a["ts_end_s"] < b["ts_start_s"]:
+        return b["ts_start_s"] - a["ts_end_s"]
+    return a["ts_start_s"] - b["ts_end_s"]
+
+
 def _dedup(rows: list[dict]) -> list[dict]:
-    """Collapse near-duplicates so one physical object appears once: same global_id,
-    or same-camera same-subtype fragments overlapping in time. Keeps best score
-    (rows arrive score-desc)."""
+    """Conservatively group fragments for display without mutating evidence rows."""
     kept: list[dict] = []
-    seen_gid: set[tuple[str, int]] = set()  # gids are scene-namespaced
     for r in rows:
+        r["fragment_ids"] = [r["tracklet_id"]]
+        r["sightings"] = 1
         gid = r.get("global_id")
-        if gid is not None:
-            key = (r["scene"], gid)
-            if key in seen_gid:
+        match = None
+        for k in kept:
+            if gid is not None and k.get("global_id") == gid and k["scene"] == r["scene"]:
+                match = k
+                break
+            if (k["scene"] != r["scene"] or k["camera_id"] != r["camera_id"]
+                    or k["entity_type"] != r["entity_type"] or k["subtype"] != r["subtype"]):
                 continue
-            seen_gid.add(key)
+            gap = _time_gap(k, r)
+            if gap is None:  # simultaneous look-alikes are distinct objects
+                continue
+            same_plate = (r.get("plate_text") and r.get("plate_text") == k.get("plate_text"))
+            if same_plate and gap <= 30.0:
+                match = k
+                break
+            if gap > config.DEDUP_MAX_GAP_S:
+                continue
+            av, bv = k.get("dedup_vector"), r.get("dedup_vector")
+            if av is not None and bv is not None and float(np.dot(av, bv)) >= config.DEDUP_MIN_SIM:
+                match = k
+                break
+        if match is None:
             kept.append(r)
-            continue
-        dup = any(
-            k.get("global_id") is None
-            and k["scene"] == r["scene"]
-            and k["camera_id"] == r["camera_id"]
-            and k["subtype"] == r["subtype"]
-            and _overlaps(k, r)
-            for k in kept
-        )
-        if not dup:
-            kept.append(r)
+        else:
+            match["fragment_ids"].append(r["tracklet_id"])
+            match["sightings"] += 1
     return kept
 
 
 def _crop_url(row: dict) -> str | None:
+    if row.get("matched_crop_ref"):
+        return f"/files/{row['matched_crop_ref']}"
     refs = row.get("crop_refs")
     return f"/files/{refs[0]}" if refs else None
 
@@ -262,48 +437,107 @@ def _shape_result(r: dict) -> dict:
         **_video_window(r["scene"], r["camera_id"], r["ts_start_s"], r["ts_end_s"]),
         "score": round(float(r["score"]), 4),
         "crop_url": _crop_url(r),
+        "matched_crop_ref": r.get("matched_crop_ref"),
         "video_url": f"/media/{r['scene']}/{r['camera_id']}" if r["video_ref"] else None,
         "global_id": r["global_id"],
         "attrs": _attr_tags(r.get("person_attrs")),
         "plate": r.get("plate_text"),
         "plate_conf": r.get("plate_conf"),
+        "sightings": r.get("sightings", 1),
+        "fragment_ids": r.get("fragment_ids", [r["tracklet_id"]]),
+        "prompt_scores": r.get("prompt_scores"),
     }
 
 
-def _search_with_vec(qvec, entity_type, scene, t0, t1, limit, camera_id=None, color=None):
-    """Shared tail for text and image queries: pgvector search + fail-open + dedup."""
-    fetch = max(limit * 4, 40)  # over-fetch so dedup still returns ~limit
-    rows = _run_query(qvec, entity_type, scene, t0, t1, fetch, camera_id, color)
+def _filter_suggestions(entity_type, t0, t1, color):
+    suggestions = []
+    if t0 is not None or t1 is not None:
+        suggestions.append({"action": "expand_time", "label": "Expand the time window"})
+    if color:
+        suggestions.append({"action": "remove_color", "label": "Remove the colour filter"})
+    if entity_type:
+        suggestions.append({"action": "all_entity_types", "label": "Search all entity types"})
+    return suggestions
 
-    fell_back = False
-    if not rows and (entity_type or color or (t0 is not None)):
-        # fail open: a starving soft filter (type/colour/time) — drop those, but keep the
-        # intentional scene + camera location the user picked
-        rows = _run_query(qvec, None, scene, None, None, fetch, camera_id, None)
-        fell_back = True
 
+def _search_with_vectors(qvecs, entity_type, scene, t0, t1, limit, camera_id=None,
+                         color=None, aggregation=None, composition=None):
+    """Shared strict-filter tail for text/image queries with a mean-vector fallback."""
+    fetch = max(limit * 8, 80)
+    chosen_aggregation = aggregation or config.CROP_AGGREGATION
+    if chosen_aggregation == "legacy_mean":
+        rows = _mean_query(qvecs[0], entity_type, scene, t0, t1, fetch, camera_id, color)
+        search_mode = "legacy_mean"
+    else:
+        rows = _multi_crop_query(
+            qvecs, entity_type, scene, t0, t1, fetch, camera_id, color,
+            aggregation=chosen_aggregation, composition=composition,
+        )
+        search_mode = "multi_crop"
+    if rows is None:
+        # Compatibility for live/legacy scenes not yet backfilled. This retains every
+        # explicit filter; it is not the former unsafe filter-relaxation fallback.
+        rows = _mean_query(qvecs[0], entity_type, scene, t0, t1, fetch, camera_id, color)
+        search_mode = "mean_fallback"
     rows = _dedup(rows)[:limit]
-    return {"results": [_shape_result(r) for r in rows], "fell_back": fell_back}
+    return {
+        "results": [_shape_result(r) for r in rows],
+        "fell_back": False,
+        "search_mode": search_mode,
+        "aggregation": chosen_aggregation,
+        "composition": composition or config.COMPOSITION_MODE,
+        "suggestions": _filter_suggestions(entity_type, t0, t1, color) if not rows else [],
+        "applied_filters": {
+            "type": entity_type, "scene": scene, "camera_id": camera_id,
+            "color": color, "t0": t0, "t1": t1,
+        },
+    }
 
 
-def search(query, entity_type, scene, t0, t1, limit, camera_id=None, color=None):
-    # translate (Gujarati/Hindi/…→English) + caption-template the raw query so it
-    # lands in SigLIP's caption-trained space; fail-open to a static wrapper.
+def search(query, entity_type, scene, t0, t1, limit, camera_id=None, color=None,
+           aggregation=None, compositional=True, composition=None):
+    # Translate first, then use a deterministic visible-vocabulary decomposition.
     rewritten = query_rewrite.rewrite(query)
-    out = _search_with_vec(encode_text(rewritten), entity_type, scene, t0, t1, limit,
-                           camera_id, color)
-    # debug/demo transparency — drop these two fields before shipping.
+    plan = query_components.build_query_plan(rewritten, entity_type)
+    if aggregation == "legacy_mean" and not compositional:
+        captions = [rewritten]
+    else:
+        captions = [plan.full_caption]
+    if compositional and captions[0] == plan.full_caption:
+        captions.extend(plan.components)
+    qvecs = list(encode_texts(captions))
+    out = _search_with_vectors(
+        qvecs, entity_type, scene, t0, t1, limit, camera_id, color,
+        aggregation=aggregation, composition=composition,
+    )
     out["original_query"] = query
     out["rewritten_query"] = rewritten
+    out["search_captions"] = captions
+    out["entity_hint"] = plan.entity_hint
+    out["searched_at_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    for result in out["results"]:
+        scores = result.pop("prompt_scores", None)
+        if scores:
+            result["component_scores"] = [
+                {"caption": caption, "score": round(float(score), 6)}
+                for caption, score in zip(captions, scores)
+            ]
     return out
 
 
-def search_image(img, entity_type, scene, t0, t1, limit, camera_id=None, color=None):
+def search_image(img, entity_type, scene, t0, t1, limit, camera_id=None, color=None,
+                 aggregation=None):
     """Reference-image search: SigLIP image tower → same vector space as text.
     NOTE image↔image scores run much higher than text↔image (modality gap) —
     ranking is comparable, absolute scores are not."""
-    return _search_with_vec(encode_image(img), entity_type, scene, t0, t1, limit,
-                            camera_id, color)
+    out = _search_with_vectors(
+        [encode_image(img)], entity_type, scene, t0, t1, limit, camera_id, color,
+        aggregation=aggregation,
+    )
+    out["searched_at_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    for result in out["results"]:
+        result.pop("prompt_scores", None)
+    return out
 
 
 # "more like this": the stored vectors ARE valid query vectors, so similarity search
