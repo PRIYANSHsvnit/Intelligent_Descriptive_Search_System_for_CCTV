@@ -160,5 +160,3 @@ on drain to print clean totals). To shrink it: `--ocr-workers 4` (CPU headroom e
 - `apps/ingest/live/ocr_worker.py` — capped ONNX OCR sessions (`_capped_models`)
 - `footage_data/cam_labels/surat-live.json` — NEW
 - `output/surat-live/<cam>/media/<cam>.mp4` — symlinks to SUR01 transcodes (not in git)
-
-
