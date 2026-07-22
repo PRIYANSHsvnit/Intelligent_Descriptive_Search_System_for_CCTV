@@ -163,6 +163,19 @@ breaks continuity of signer identity. See
 [`docs/forensic-export.md`](./docs/forensic-export.md) for the package format, CLI verifier,
 trust model, database migration, and safe tamper demo.
 
+## Audited investigation workflow
+
+Enter a case ID and officer/badge ID before searching. Searches are written to an append-only
+ledger with the original and normalized query, filters, model inventory, ordered results,
+component scores, latency, and timestamp. Each result exposes **Why this matched**, including
+the separate stored crop that best supports every query component.
+
+Use **Pin** or **Exclude** to build the case board. Notes, exclusion reasons, and all state
+changes remain visible in the case timeline. **Export pinned** produces a signed case bundle;
+the existing verifier checks the parent bundle and every independently signed child evidence
+package. Apply `infra/schema.sql` before using these endpoints. See
+[`docs/investigation-workflow.md`](./docs/investigation-workflow.md).
+
 ### Backend environment variables (`.env`)
 
 If you need environment variables for the API:

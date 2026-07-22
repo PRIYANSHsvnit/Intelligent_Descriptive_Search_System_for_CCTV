@@ -127,6 +127,31 @@ class ForensicExportTests(unittest.TestCase):
         self.assertTrue(verification["valid"])
         self.assertIn("signer identity was not pinned", verification["warnings"][0])
 
+    def test_case_bundle_verifies_parent_and_nested_export(self):
+        child = self._create()
+        item = {
+            "tracklet_id": "SUR01_c001_p7",
+            "status": "pinned",
+            "note": "Confirmed by investigator",
+            "result_snapshot": {},
+        }
+        with (
+            mock.patch.object(forensics, "create_export", return_value=child),
+            mock.patch.object(forensics.config, "FORENSIC_EXPORT_ROOT", self.export_dir),
+            mock.patch.object(forensics.config, "FORENSIC_KEY_DIR", self.key_dir),
+        ):
+            bundle = forensics.create_case_bundle("FIR-2026-42", "Badge 17", [item])
+            _, trusted_key = forensics._key_paths(self.key_dir)
+            verification = forensics.verify_package(bundle.package_path, trusted_key)
+
+        self.assertEqual("VALID", verification["status"])
+        self.assertEqual(bundle.bundle_id, verification["export_id"])
+        with zipfile.ZipFile(bundle.package_path) as archive:
+            manifest = json.loads(archive.read("case-bundle/manifest.json"))
+        self.assertEqual("only case items whose current status was pinned",
+                         manifest["selection_policy"])
+        self.assertEqual(child.export_id, manifest["evidence"][0]["child_export_id"])
+
 
 if __name__ == "__main__":
     unittest.main()

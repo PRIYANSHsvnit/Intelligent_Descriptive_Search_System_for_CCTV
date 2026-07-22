@@ -126,6 +126,66 @@ CREATE TRIGGER forensic_exports_append_only
 BEFORE UPDATE OR DELETE ON forensic_exports
 FOR EACH ROW EXECUTE FUNCTION reject_forensic_export_mutation();
 
+-- Investigation workspace. `cases` and `case_items` are current working state;
+-- `search_events` is the immutable audit ledger that explains every state transition.
+-- Authentication is deliberately out of scope for the hackathon prototype, therefore
+-- officer is an explicit badge/name supplied by the operator and recorded on each event.
+CREATE TABLE IF NOT EXISTS cases (
+  case_id       TEXT PRIMARY KEY,
+  title         TEXT,
+  officer       TEXT NOT NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS case_items (
+  case_id         TEXT NOT NULL REFERENCES cases(case_id) ON DELETE CASCADE,
+  tracklet_id     TEXT NOT NULL REFERENCES tracklets(tracklet_id),
+  status          TEXT NOT NULL CHECK (status IN ('pinned', 'excluded')),
+  note            TEXT,
+  result_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (case_id, tracklet_id)
+);
+
+CREATE INDEX IF NOT EXISTS case_items_case_status_time
+  ON case_items (case_id, status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS search_events (
+  event_id          UUID PRIMARY KEY,
+  case_id           TEXT REFERENCES cases(case_id),
+  officer           TEXT NOT NULL,
+  event_type        TEXT NOT NULL CHECK (event_type IN (
+    'search', 'result_pinned', 'result_excluded', 'note_updated',
+    'case_created', 'export_created', 'case_export_created'
+  )),
+  occurred_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  original_query    TEXT,
+  normalized_query  TEXT,
+  filters           JSONB NOT NULL DEFAULT '{}'::jsonb,
+  search_mode       TEXT,
+  model_versions    JSONB NOT NULL DEFAULT '{}'::jsonb,
+  returned_results  JSONB NOT NULL DEFAULT '[]'::jsonb,
+  latency_ms        REAL,
+  metadata          JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS search_events_case_time
+  ON search_events (case_id, occurred_at DESC);
+
+CREATE OR REPLACE FUNCTION reject_search_event_mutation()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE EXCEPTION 'search and investigation events are append-only';
+END;
+$$;
+
+DROP TRIGGER IF EXISTS search_events_append_only ON search_events;
+CREATE TRIGGER search_events_append_only
+BEFORE UPDATE OR DELETE ON search_events
+FOR EACH ROW EXECUTE FUNCTION reject_search_event_mutation();
+
 -- Additive column for DBs created before the plate stage (CREATE TABLE IF NOT
 -- EXISTS won't add it); harmless no-op on fresh DBs.
 ALTER TABLE tracklets ADD COLUMN IF NOT EXISTS plate_raw TEXT;

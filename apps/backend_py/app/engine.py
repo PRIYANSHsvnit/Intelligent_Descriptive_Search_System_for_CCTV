@@ -215,7 +215,7 @@ def _multi_crop_query(qvecs, entity_type, scene, t0, t1, limit, camera_id=None,
 
     ids = list(grouped)
     per_prompt = np.zeros((len(qvecs), len(ids)), dtype=np.float32)
-    best_full_index = np.zeros(len(ids), dtype=np.int32)
+    best_prompt_indices = np.zeros((len(qvecs), len(ids)), dtype=np.int32)
     for j, tid in enumerate(ids):
         vectors = np.stack(grouped[tid]["vectors"])
         mean = vectors.mean(axis=0)
@@ -223,8 +223,7 @@ def _multi_crop_query(qvecs, entity_type, scene, t0, t1, limit, camera_id=None,
         for pi, qvec in enumerate(qvecs):
             sims = vectors @ qvec
             per_prompt[pi, j] = _aggregate(sims, aggregation)
-            if pi == 0:
-                best_full_index[j] = int(np.argmax(sims))
+            best_prompt_indices[pi, j] = int(np.argmax(sims))
 
     if len(qvecs) == 1:
         final = per_prompt[0]
@@ -244,7 +243,10 @@ def _multi_crop_query(qvecs, entity_type, scene, t0, t1, limit, camera_id=None,
         row = group["row"]
         row["score"] = float(final[j])
         row["prompt_scores"] = [float(per_prompt[pi, j]) for pi in range(len(qvecs))]
-        row["matched_crop_ref"] = group["refs"][best_full_index[j]]
+        row["prompt_crop_refs"] = [
+            group["refs"][best_prompt_indices[pi, j]] for pi in range(len(qvecs))
+        ]
+        row["matched_crop_ref"] = row["prompt_crop_refs"][0]
         row["dedup_vector"] = group["dedup_vector"]
         rows.append(row)
     rows.sort(key=lambda row: row["score"], reverse=True)
@@ -430,6 +432,7 @@ def _shape_result(r: dict) -> dict:
         "scene": r["scene"],
         "camera_id": r["camera_id"],
         "camera_label": config.camera_label(r["scene"], r["camera_id"]),
+        "entity_type": r["entity_type"],
         "subtype": r["subtype"],
         "color": r["color"],
         "ts_start_s": round(r["ts_start_s"], 2),
@@ -446,6 +449,7 @@ def _shape_result(r: dict) -> dict:
         "sightings": r.get("sightings", 1),
         "fragment_ids": r.get("fragment_ids", [r["tracklet_id"]]),
         "prompt_scores": r.get("prompt_scores"),
+        "prompt_crop_refs": r.get("prompt_crop_refs"),
     }
 
 
@@ -517,11 +521,42 @@ def search(query, entity_type, scene, t0, t1, limit, camera_id=None, color=None,
     out["searched_at_utc"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     for result in out["results"]:
         scores = result.pop("prompt_scores", None)
+        crop_refs = result.pop("prompt_crop_refs", None) or []
         if scores:
             result["component_scores"] = [
-                {"caption": caption, "score": round(float(score), 6)}
-                for caption, score in zip(captions, scores)
+                {
+                    "caption": caption,
+                    "score": round(float(score), 6),
+                    "kind": "overall" if index == 0 else "component",
+                    "supporting_crop_ref": crop_refs[index] if index < len(crop_refs) else None,
+                    "supporting_crop_url": (
+                        f"/files/{crop_refs[index]}" if index < len(crop_refs) else None
+                    ),
+                }
+                for index, (caption, score) in enumerate(zip(captions, scores))
             ]
+    # These labels are deliberately relative to this result set, not calibrated model
+    # probabilities. They make the explanation readable without calling similarity a
+    # confidence percentage.
+    for component_index in range(len(captions)):
+        available = [
+            row["component_scores"][component_index]["score"]
+            for row in out["results"]
+            if len(row.get("component_scores", [])) > component_index
+        ]
+        if not available:
+            continue
+        low, high = np.percentile(available, [35, 70]) if len(available) > 2 else (
+            min(available), max(available)
+        )
+        for row in out["results"]:
+            if len(row.get("component_scores", [])) <= component_index:
+                continue
+            component = row["component_scores"][component_index]
+            value = component["score"]
+            component["match_strength"] = (
+                "strong" if value >= high else "moderate" if value >= low else "weak"
+            )
     return out
 
 

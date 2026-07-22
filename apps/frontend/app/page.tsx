@@ -13,6 +13,7 @@ type Result = {
   scene: string;
   camera_id: string;
   camera_label?: string;
+  entity_type?: "person" | "vehicle";
   subtype: string;
   color: string | null;
   ts_start_s: number;
@@ -29,7 +30,11 @@ type Result = {
   sightings?: number;
   matched_on?: "exact" | "partial" | "fuzzy";
   matched_crop_ref?: string | null;
-  component_scores?: { caption: string; score: number }[];
+  component_scores?: {
+    caption: string; score: number; kind?: "overall" | "component";
+    match_strength?: "strong" | "moderate" | "weak";
+    supporting_crop_ref?: string | null; supporting_crop_url?: string | null;
+  }[];
 };
 
 type SearchEvidenceContext = {
@@ -74,6 +79,26 @@ type Hop = {
 type Suggestion = {
   action: "expand_time" | "remove_color" | "all_entity_types";
   label: string;
+};
+
+type CaseItem = Result & {
+  case_id: string;
+  status: "pinned" | "excluded";
+  note?: string | null;
+  result_snapshot?: Partial<Result> & { search?: SearchEvidenceContext; retrieval?: Record<string, unknown> };
+  created_at: string;
+  updated_at: string;
+};
+
+type AuditEvent = {
+  event_id: string; event_type: string; occurred_at: string; officer: string;
+  original_query?: string | null; latency_ms?: number | null;
+  metadata?: Record<string, unknown>;
+};
+
+type CaseBoardData = {
+  case: { case_id: string; title?: string | null; officer: string; created_at: string };
+  items: CaseItem[];
 };
 
 // describe/plate examples share one bar — clicking a plate one flips the detected mode
@@ -136,6 +161,12 @@ export default function Home() {
   const [searchEvidence, setSearchEvidence] = useState<SearchEvidenceContext | null>(null);
   const [verification, setVerification] = useState<VerificationResult | null>(null);
   const [verifying, setVerifying] = useState(false);
+  const [caseId, setCaseId] = useState(`CASE-${new Date().toISOString().slice(0, 10).replaceAll("-", "")}`);
+  const [officer, setOfficer] = useState("");
+  const [boardOpen, setBoardOpen] = useState(false);
+  const [board, setBoard] = useState<CaseBoardData | null>(null);
+  const [timeline, setTimeline] = useState<AuditEvent[]>([]);
+  const [boardMessage, setBoardMessage] = useState<string | null>(null);
 
   const auto = detectMode(q);
   const effMode: "plate" | "describe" = forceMode ?? auto;
@@ -154,6 +185,10 @@ export default function Home() {
   const runSearch = useCallback(async (queryArg?: string) => {
     const query = queryArg ?? q;
     if (!query.trim()) return;
+    if (!caseId.trim() || !officer.trim()) {
+      setError("Enter a case ID and officer / badge ID before searching so the investigation is auditable.");
+      return;
+    }
     const em = forceMode ?? detectMode(query);
     setLoading(true); setSearched(true); setContext(null); setError(null);
     try {
@@ -163,6 +198,7 @@ export default function Home() {
       if (scene) p.set("scene", scene);
       if (cameraId) p.set("camera_id", cameraId);
       if (timeSet) { p.set("t0", String(hhmmToSec(tFrom))); p.set("t1", String(hhmmToSec(tTo))); }
+      p.set("case_id", caseId.trim()); p.set("officer", officer.trim());
       const r = await fetch(`${API}/search?${p}`);
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const data = await r.json();
@@ -191,9 +227,13 @@ export default function Home() {
     } finally {
       setLoading(false);
     }
-  }, [q, forceMode, scene, cameraId, timeSet, tFrom, tTo]);
+  }, [q, forceMode, scene, cameraId, timeSet, tFrom, tTo, caseId, officer]);
 
   const runImageSearch = useCallback(async (file: File) => {
+    if (!caseId.trim() || !officer.trim()) {
+      setError("Enter a case ID and officer / badge ID before searching so the investigation is auditable.");
+      return;
+    }
     setLoading(true); setSearched(true); setContext("matches for the uploaded photo"); setError(null);
     try {
       const fd = new FormData();
@@ -202,6 +242,7 @@ export default function Home() {
       if (cameraId) fd.append("camera_id", cameraId);
       if (timeSet) { fd.append("t0", String(hhmmToSec(tFrom))); fd.append("t1", String(hhmmToSec(tTo))); }
       fd.append("limit", "24");
+      fd.append("case_id", caseId.trim()); fd.append("officer", officer.trim());
       const r = await fetch(`${API}/search/image`, { method: "POST", body: fd });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const data = await r.json();
@@ -226,16 +267,20 @@ export default function Home() {
     } finally {
       setLoading(false);
     }
-  }, [scene, cameraId, timeSet, tFrom, tTo]);
+  }, [scene, cameraId, timeSet, tFrom, tTo, caseId, officer]);
 
   const runSimilar = useCallback(async (r: Result, vec: "semantic" | "reid") => {
+    if (!caseId.trim() || !officer.trim()) {
+      setError("Enter a case ID and officer / badge ID before searching so the investigation is auditable.");
+      return;
+    }
     setActive(null); setLoading(true); setSearched(true);
     setContext(vec === "reid"
       ? `re-ID matches for ${r.subtype} ${r.tracklet_id} (same object, other sightings)`
       : `tracklets that look similar to ${r.subtype} ${r.tracklet_id}`);
     setError(null);
     try {
-      const p = new URLSearchParams({ tracklet_id: r.tracklet_id, vec, limit: "24" });
+      const p = new URLSearchParams({ tracklet_id: r.tracklet_id, vec, limit: "24", case_id: caseId.trim(), officer: officer.trim() });
       const res = await fetch(`${API}/search/similar?${p}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
@@ -251,7 +296,55 @@ export default function Home() {
     } catch (e) {
       setResults([]); setSuggestions([]); setError(`Similar search failed (${e instanceof Error ? e.message : "network"}).`);
     } finally { setLoading(false); }
-  }, []);
+  }, [caseId, officer]);
+
+  const loadBoard = useCallback(async () => {
+    if (!caseId.trim() || !officer.trim()) return;
+    await fetch(`${API}/cases`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ case_id: caseId.trim(), officer: officer.trim() }),
+    });
+    const [boardResponse, timelineResponse] = await Promise.all([
+      fetch(`${API}/cases/${encodeURIComponent(caseId.trim())}`),
+      fetch(`${API}/cases/${encodeURIComponent(caseId.trim())}/timeline`),
+    ]);
+    if (!boardResponse.ok) throw new Error(`HTTP ${boardResponse.status}`);
+    setBoard(await boardResponse.json());
+    setTimeline(timelineResponse.ok ? (await timelineResponse.json()).events ?? [] : []);
+  }, [caseId, officer]);
+
+  const setCaseItem = useCallback(async (result: Result, status: "pinned" | "excluded", note?: string) => {
+    if (!caseId.trim() || !officer.trim()) {
+      setError("Enter a case ID and officer / badge ID first."); return;
+    }
+    setBoardMessage(status === "pinned" ? "Pinning evidence…" : "Recording exclusion…");
+    const response = await fetch(`${API}/cases/${encodeURIComponent(caseId.trim())}/items/${encodeURIComponent(result.tracklet_id)}`, {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        officer: officer.trim(), status, note: note ?? null,
+        result_snapshot: {
+          ...result,
+          search: searchEvidence,
+          retrieval: {
+            method: searchEvidence?.method, aggregation: searchEvidence?.aggregation,
+            composition: searchEvidence?.composition, search_captions: searchEvidence?.search_captions,
+            result_score: result.score, component_scores: result.component_scores ?? [],
+          },
+        },
+      }),
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => null);
+      setBoardMessage(body?.detail ?? `Could not update case (${response.status})`); return;
+    }
+    await loadBoard();
+    setBoardMessage(status === "pinned" ? "Pinned to case." : "Excluded with an auditable reason.");
+  }, [caseId, officer, searchEvidence, loadBoard]);
+
+  useEffect(() => {
+    if (!boardOpen) return;
+    loadBoard().catch((e) => setBoardMessage(`Could not load case: ${e instanceof Error ? e.message : "unknown error"}`));
+  }, [boardOpen, loadBoard]);
 
   const onPickImage = useCallback((f: File | null) => {
     if (!f) return;
@@ -302,6 +395,11 @@ export default function Home() {
           </div>
         </div>
         <div className={styles.spacer} />
+        <div className={styles.caseIdentity}>
+          <label>Case<input value={caseId} maxLength={120} onChange={(e) => setCaseId(e.target.value)} /></label>
+          <label>Officer<input value={officer} maxLength={120} placeholder="Badge / name" onChange={(e) => setOfficer(e.target.value)} /></label>
+          <button type="button" onClick={() => setBoardOpen(true)}>Case board <b>{board?.items.filter((i) => i.status === "pinned").length ?? 0}</b></button>
+        </div>
         <label className={styles.verifyBtn}>
           {verifying ? "Verifying…" : "Verify export"}
           <input type="file" accept=".zip,application/zip" hidden disabled={verifying}
@@ -434,7 +532,8 @@ export default function Home() {
 
         <div className={styles.grid}>
           {results.map((r) => (
-            <button key={r.tracklet_id} className={styles.card} onClick={() => setActive(r)}>
+            <article key={r.tracklet_id} className={styles.card}>
+              <button type="button" className={styles.cardOpen} onClick={() => setActive(r)}>
               <div className={styles.thumbWrap}>
                 {r.crop_url
                   ? <img className={styles.thumb} src={`${API}${r.crop_url}`} alt={r.subtype} loading="lazy" />
@@ -458,12 +557,25 @@ export default function Home() {
                   </div>
                 )}
               </div>
-            </button>
+              </button>
+              <div className={styles.cardActions}>
+                <button type="button" onClick={() => setCaseItem(r, "pinned")}>＋ Pin</button>
+                <button type="button" onClick={() => {
+                  const reason = window.prompt("Reason for excluding this result (recorded in the audit trail):");
+                  if (reason !== null) setCaseItem(r, "excluded", reason);
+                }}>Exclude</button>
+              </div>
+            </article>
           ))}
         </div>
       </div>
 
-      {active && <Player result={active} search={searchEvidence} onClose={() => setActive(null)} onSimilar={runSimilar} />}
+      {active && <Player result={active} search={searchEvidence} caseId={caseId} officer={officer}
+        onClose={() => setActive(null)} onSimilar={runSimilar} onCaseItem={setCaseItem} />}
+      {boardOpen && <CaseBoard board={board} timeline={timeline} caseId={caseId} officer={officer}
+        message={boardMessage} onClose={() => setBoardOpen(false)} onRefresh={loadBoard}
+        onOpen={(item) => { setBoardOpen(false); setActive({ ...(item.result_snapshot ?? {}), ...item } as Result); }}
+        onUpdate={setCaseItem} />}
     </main>
   );
 }
@@ -617,14 +729,16 @@ function boxIndexAt(boxes: BoxRow[], t: number): number {
   return ans;
 }
 
-function Player({ result, search, onClose, onSimilar }: {
-  result: Result; search: SearchEvidenceContext | null; onClose: () => void;
+function Player({ result, search, caseId, officer, onClose, onSimilar, onCaseItem }: {
+  result: Result; search: SearchEvidenceContext | null; caseId: string; officer: string; onClose: () => void;
   onSimilar: (r: Result, vec: "semantic" | "reid") => void;
+  onCaseItem: (r: Result, status: "pinned" | "excluded", note?: string) => void;
 }) {
   const ref = useRef<HTMLVideoElement>(null);
   const boxRef = useRef<SVGRectElement>(null);
   const [boxes, setBoxes] = useState<BoxRow[] | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
+  const [explainCrop, setExplainCrop] = useState<string | null>(result.crop_url);
   const src = result.video_url ? `${API}${result.video_url}` : null;
   const seek0 = result.video_start_s ?? result.ts_start_s;
   const seek1 = result.video_end_s ?? result.ts_end_s;
@@ -676,10 +790,34 @@ function Player({ result, search, onClose, onSimilar }: {
           </span>
           <button className={styles.simBtn} onClick={() => onSimilar(result, "semantic")} title="objects that look like this one">similar look</button>
           <button className={styles.simBtn} onClick={() => onSimilar(result, "reid")} title="other sightings of this exact object">same object</button>
+          <button className={styles.simBtn} onClick={() => onCaseItem(result, "pinned")}>pin to case</button>
           <button className={styles.exportBtn} onClick={() => setExportOpen((v) => !v)}>Export evidence</button>
           <button className={styles.close} onClick={onClose}>✕</button>
         </div>
-        {exportOpen && <ExportPanel result={result} search={search} />}
+        {exportOpen && <ExportPanel result={result} search={search} caseId={caseId} officer={officer} />}
+        <div className={styles.whyPanel}>
+          <div className={styles.whyCopy}>
+            <strong>Why this matched</strong>
+            <span>Relative match strength within these results—not a probability.</span>
+            <div className={styles.whyFacts}>
+              <span>✓ {result.entity_type ?? result.subtype} · detector confirmed</span>
+              <span>📍 {result.camera_label ?? result.camera_id}</span>
+              <span>◷ {fmt(result.ts_start_s)}–{fmt(result.ts_end_s)}</span>
+            </div>
+            <div className={styles.components}>
+              {result.component_scores?.map((component, index) => (
+                <button type="button" key={`${component.caption}-${index}`}
+                  className={cx(component.supporting_crop_url === explainCrop && styles.selected)}
+                  onClick={() => setExplainCrop(component.supporting_crop_url ?? result.crop_url)}>
+                  <span>{component.kind === "overall" ? "Overall description" : `✓ ${component.caption}`}</span>
+                  <b className={styles[component.match_strength ?? "moderate"]}>{component.match_strength ?? "ranked"}</b>
+                  <code>{component.score.toFixed(3)}</code>
+                </button>
+              )) ?? <span>Structured plate/metadata match; no semantic components were used.</span>}
+            </div>
+          </div>
+          {explainCrop && <img src={`${API}${explainCrop}`} alt="crop supporting the selected query component" />}
+        </div>
         {src ? (
           <div className={styles.videoWrap}>
             <video ref={ref} className={styles.video} src={src} controls autoPlay
@@ -694,9 +832,9 @@ function Player({ result, search, onClose, onSimilar }: {
   );
 }
 
-function ExportPanel({ result, search }: { result: Result; search: SearchEvidenceContext | null }) {
-  const [caseId, setCaseId] = useState(`CASE-${new Date().toISOString().slice(0, 10).replaceAll("-", "")}`);
-  const [officer, setOfficer] = useState("");
+function ExportPanel({ result, search, caseId, officer }: {
+  result: Result; search: SearchEvidenceContext | null; caseId: string; officer: string;
+}) {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
 
@@ -749,10 +887,111 @@ function ExportPanel({ result, search }: { result: Result; search: SearchEvidenc
   return (
     <div className={styles.exportPanel}>
       <div><strong>Forensic export</strong><span>Source recording remains unannotated; derived files are labelled and signed.</span></div>
-      <label>Case ID<input value={caseId} maxLength={120} onChange={(e) => setCaseId(e.target.value)} /></label>
-      <label>Officer / user<input value={officer} maxLength={120} placeholder="Name or badge ID" onChange={(e) => setOfficer(e.target.value)} /></label>
+      <label>Case ID<input value={caseId} readOnly /></label>
+      <label>Officer / user<input value={officer} readOnly /></label>
       <button type="button" disabled={busy} onClick={create}>{busy ? "Building package…" : "Create signed ZIP"}</button>
       {message && <p>{message}</p>}
+    </div>
+  );
+}
+
+function CaseBoard({ board, timeline, caseId, officer, message, onClose, onRefresh, onOpen, onUpdate }: {
+  board: CaseBoardData | null; timeline: AuditEvent[]; caseId: string; officer: string;
+  message: string | null; onClose: () => void; onRefresh: () => Promise<void>;
+  onOpen: (item: CaseItem) => void;
+  onUpdate: (result: Result, status: "pinned" | "excluded", note?: string) => Promise<void>;
+}) {
+  const [tab, setTab] = useState<"evidence" | "timeline">("evidence");
+  const [exporting, setExporting] = useState(false);
+  const pinned = board?.items.filter((item) => item.status === "pinned") ?? [];
+  const excluded = board?.items.filter((item) => item.status === "excluded") ?? [];
+
+  const exportPinned = async () => {
+    setExporting(true);
+    try {
+      const response = await fetch(`${API}/cases/${encodeURIComponent(caseId)}/export`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ officer }),
+      });
+      if (!response.ok) {
+        const detail = await response.json().catch(() => null);
+        throw new Error(detail?.detail ?? `HTTP ${response.status}`);
+      }
+      const blob = await response.blob();
+      const disposition = response.headers.get("Content-Disposition") ?? "";
+      const filename = disposition.match(/filename="?([^";]+)"?/)?.[1] ?? `${caseId}-bundle.zip`;
+      const href = URL.createObjectURL(blob);
+      const anchor = document.createElement("a"); anchor.href = href; anchor.download = filename;
+      document.body.appendChild(anchor); anchor.click(); anchor.remove(); URL.revokeObjectURL(href);
+      await onRefresh();
+    } catch (error) {
+      window.alert(`Case export failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    } finally { setExporting(false); }
+  };
+
+  return (
+    <div className={styles.boardOverlay} onClick={onClose}>
+      <aside className={styles.board} onClick={(event) => event.stopPropagation()}>
+        <header>
+          <div><strong>{caseId}</strong><span>{officer || "Officer not set"}</span></div>
+          <button type="button" onClick={onClose}>✕</button>
+        </header>
+        <div className={styles.boardTabs}>
+          <button className={cx(tab === "evidence" && styles.on)} onClick={() => setTab("evidence")}>Evidence {pinned.length}</button>
+          <button className={cx(tab === "timeline" && styles.on)} onClick={() => setTab("timeline")}>Audit timeline {timeline.length}</button>
+          <button className={styles.bundleBtn} disabled={exporting || pinned.length === 0} onClick={exportPinned}>
+            {exporting ? "Signing…" : "Export pinned"}
+          </button>
+        </div>
+        {message && <div className={styles.boardMessage}>{message}</div>}
+        {tab === "evidence" ? (
+          <div className={styles.boardList}>
+            {!board && <div className={styles.status}>Loading case…</div>}
+            {pinned.map((item) => <CaseItemRow key={item.tracklet_id} item={item} onOpen={onOpen} onUpdate={onUpdate} />)}
+            {excluded.length > 0 && <h4>Excluded results · preserved for audit</h4>}
+            {excluded.map((item) => <CaseItemRow key={item.tracklet_id} item={item} onOpen={onOpen} onUpdate={onUpdate} />)}
+            {board && board.items.length === 0 && <div className={styles.status}>Pin a search result to begin the case board.</div>}
+          </div>
+        ) : (
+          <div className={styles.auditList}>
+            {[...timeline].reverse().map((event) => (
+              <div key={event.event_id} className={styles.auditEvent}>
+                <i /><div><strong>{event.event_type.replaceAll("_", " ")}</strong>
+                  <span>{new Date(event.occurred_at).toLocaleString()} · {event.officer}</span>
+                  {event.original_query && <p>“{event.original_query}”</p>}
+                  {event.latency_ms != null && <code>{Math.round(event.latency_ms)} ms</code>}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </aside>
+    </div>
+  );
+}
+
+function CaseItemRow({ item, onOpen, onUpdate }: {
+  item: CaseItem; onOpen: (item: CaseItem) => void;
+  onUpdate: (result: Result, status: "pinned" | "excluded", note?: string) => Promise<void>;
+}) {
+  const [note, setNote] = useState(item.note ?? "");
+  useEffect(() => setNote(item.note ?? ""), [item.note]);
+  return (
+    <div className={cx(styles.caseItem, item.status === "excluded" && styles.excluded)}>
+      <button type="button" className={styles.caseThumb} onClick={() => onOpen(item)}>
+        {item.crop_url && <img src={`${API}${item.crop_url}`} alt={item.subtype} />}
+      </button>
+      <div className={styles.caseMeta}>
+        <strong>{item.subtype} · {item.camera_label ?? item.camera_id}</strong>
+        <span>{fmt(item.ts_start_s)}–{fmt(item.ts_end_s)} · {item.tracklet_id}</span>
+        <textarea value={note} placeholder={item.status === "excluded" ? "Exclusion reason" : "Investigator note"}
+          onChange={(event) => setNote(event.target.value)} />
+        <div>
+          <button type="button" onClick={() => onUpdate(item, item.status, note)}>Save note</button>
+          {item.status === "excluded" && <button type="button" onClick={() => onUpdate(item, "pinned", note)}>Restore to evidence</button>}
+          {item.status === "pinned" && <button type="button" onClick={() => onUpdate(item, "excluded", note || "Excluded during case review")}>Exclude</button>}
+        </div>
+      </div>
     </div>
   );
 }

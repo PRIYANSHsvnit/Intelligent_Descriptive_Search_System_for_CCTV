@@ -63,7 +63,11 @@ Tracking sheet against the Surat Smart City problem statement
   provenance and artifact roles; `SHA256SUMS` covers all evidence and metadata artifacts;
   Ed25519 signs the checksum file; UI/CLI verification pins the deployment public key;
   `forensic_exports` keeps an append-only server receipt
-- ❌ **IV.b** Search-history and audit logging
+- ✅ **IV.b** Search-history and audit logging
+  — every case-scoped search records the officer, original/normalized query, authoritative
+  filters, model inventory, ranked tracklet IDs and component scores, latency, and timestamp
+  in append-only `search_events`; pin/exclude/note/export actions share the same immutable
+  case timeline
 
 ## Bonus Points
 
@@ -92,6 +96,17 @@ Tracking sheet against the Surat Smart City problem statement
 - ✅ Documentation (models, indexing, integrity controls)
   — model/index/retrieval design plus forensic trust model, package layout, key handling,
   verification, and tamper-demo procedure are documented
+
+## Investigation Workflow
+
+- ✅ Component-level “Why this matched” explanations use measured SigLIP similarities and
+  show the independently selected crop supporting each query component. Strength labels are
+  explicitly relative to the returned candidates, never presented as calibrated confidence.
+- ✅ Case board supports pinned evidence, exclusions with preserved reasons, investigator
+  notes, chronological review, and an append-only action timeline.
+- ✅ “Export pinned” creates a signed case bundle containing only currently pinned items;
+  each nested evidence ZIP remains independently signed and the verifier validates both the
+  bundle and every child package.
 
 ## Some More things to Fix
 - ✅ 1. HNSW recall — DONE. `backend config.HNSW_EF_SEARCH` (default 200, env-overridable)

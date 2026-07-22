@@ -42,6 +42,7 @@ from PIL import Image, ImageDraw, ImageFont
 from . import boxes, config
 
 PACKAGE_ROOT = "case-export"
+BUNDLE_ROOT = "case-bundle"
 REQUIRED_FILES = {
     "original_or_source_clip.mp4",
     "selected_clip.mp4",
@@ -68,6 +69,15 @@ class ExportResult:
     manifest_sha256: str
     source_sha256: str
     signing_key_id: str
+
+
+@dataclass(frozen=True)
+class BundleResult:
+    bundle_id: str
+    case_id: str
+    package_path: Path
+    signing_key_id: str
+    export_ids: list[str]
 
 
 def _utc_now() -> datetime:
@@ -510,6 +520,88 @@ def create_export(request: dict[str, Any]) -> ExportResult:
     return result
 
 
+def create_case_bundle(
+    case_id: str, officer: str, items: list[dict[str, Any]],
+) -> BundleResult:
+    """Create a signed collection whose children remain independently verifiable exports."""
+    if not items:
+        raise ForensicExportError("case has no pinned evidence")
+    bundle_id = str(uuid.uuid4())
+    safe_case_id = _safe_identifier(case_id, f"CASE-{bundle_id[:8]}")
+    private_path, public_path = ensure_signing_key()
+    private_key = _load_private_key(private_path)
+    public_bytes = public_path.read_bytes()
+    key_id = _key_id(public_bytes)
+    export_root = config.FORENSIC_EXPORT_ROOT
+    export_root.mkdir(parents=True, exist_ok=True)
+    children: list[tuple[str, ExportResult, dict[str, Any]]] = []
+    for index, item in enumerate(items, start=1):
+        snapshot = item.get("result_snapshot") or {}
+        request = {
+            "tracklet_id": item["tracklet_id"],
+            "case_id": safe_case_id,
+            "officer": officer,
+            "selected_crop_ref": snapshot.get("matched_crop_ref"),
+            "search": snapshot.get("search") or {},
+            "retrieval": snapshot.get("retrieval") or {},
+        }
+        child = create_export(request)
+        child_name = f"evidence-{index:03d}-{_safe_identifier(item['tracklet_id'], 'tracklet')}.zip"
+        children.append((child_name, child, item))
+
+    with tempfile.TemporaryDirectory(prefix="case-bundle-", dir=export_root) as temp_name:
+        stage = Path(temp_name) / BUNDLE_ROOT
+        stage.mkdir()
+        (stage / "public_key.pem").write_bytes(public_bytes)
+        evidence_inventory = []
+        for name, child, item in children:
+            shutil.copy2(child.package_path, stage / name)
+            evidence_inventory.append({
+                "tracklet_id": item["tracklet_id"],
+                "status": "pinned",
+                "note": item.get("note"),
+                "child_export_id": child.export_id,
+                "file": name,
+                "sha256": _sha256_file(stage / name),
+                "source_sha256": child.source_sha256,
+            })
+        manifest = {
+            "schema": "surat-cctv-forensic-case-bundle/v1",
+            "bundle_id": bundle_id,
+            "case_id": safe_case_id,
+            "officer": officer,
+            "created_at_utc": _iso(_utc_now()),
+            "selection_policy": "only case items whose current status was pinned",
+            "evidence": evidence_inventory,
+            "integrity": {
+                "hash_algorithm": "SHA-256",
+                "signature_algorithm": "Ed25519",
+                "signing_key_id": key_id,
+                "signed_file": "SHA256SUMS",
+                "child_packages": "each child is also an independently signed case export",
+            },
+        }
+        _write_json(stage / "manifest.json", manifest)
+        hashed = ["manifest.json", "public_key.pem", *(name for name, _, _ in children)]
+        sums_bytes = "".join(
+            f"{_sha256_file(stage / name)}  {name}\n" for name in sorted(hashed)
+        ).encode("utf-8")
+        (stage / "SHA256SUMS").write_bytes(sums_bytes)
+        (stage / "signature.sig").write_text(
+            base64.b64encode(private_key.sign(sums_bytes)).decode("ascii") + "\n",
+            encoding="ascii",
+        )
+        package_path = export_root / f"{safe_case_id}_bundle_{bundle_id}.zip"
+        with zipfile.ZipFile(package_path, "x", compression=zipfile.ZIP_STORED,
+                             allowZip64=True) as archive:
+            for path in sorted(stage.iterdir()):
+                archive.write(path, f"{BUNDLE_ROOT}/{path.name}")
+    return BundleResult(
+        bundle_id=bundle_id, case_id=safe_case_id, package_path=package_path,
+        signing_key_id=key_id, export_ids=[child.export_id for _, child, _ in children],
+    )
+
+
 def _entry_name(name: str) -> str | None:
     path = PurePosixPath(name)
     if path.is_absolute() or ".." in path.parts or len(path.parts) != 2:
@@ -552,6 +644,18 @@ def _parse_sums(data: bytes) -> tuple[dict[str, str], list[str]]:
 
 
 def verify_package(package: Path, trusted_public_key: Path | None = None) -> dict[str, Any]:
+    try:
+        with zipfile.ZipFile(package) as archive:
+            roots = {PurePosixPath(member.filename).parts[0] for member in archive.infolist()
+                     if not member.is_dir() and PurePosixPath(member.filename).parts}
+        if roots == {BUNDLE_ROOT}:
+            return _verify_case_bundle(package, trusted_public_key)
+    except (FileNotFoundError, zipfile.BadZipFile, OSError):
+        pass
+    return _verify_single_export(package, trusted_public_key)
+
+
+def _verify_single_export(package: Path, trusted_public_key: Path | None = None) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
     export_id = None
@@ -630,6 +734,94 @@ def verify_package(package: Path, trusted_public_key: Path | None = None) -> dic
     except (FileNotFoundError, zipfile.BadZipFile, OSError) as exc:
         errors.append(f"could not read package: {exc}")
     return _verification_result(errors, warnings, export_id, key_id)
+
+
+def _verify_case_bundle(package: Path, trusted_public_key: Path | None = None) -> dict[str, Any]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    bundle_id = None
+    key_id = None
+    try:
+        with zipfile.ZipFile(package) as archive:
+            members: dict[str, zipfile.ZipInfo] = {}
+            for member in archive.infolist():
+                if member.is_dir():
+                    continue
+                path = PurePosixPath(member.filename)
+                if (path.is_absolute() or ".." in path.parts or len(path.parts) != 2
+                        or path.parts[0] != BUNDLE_ROOT):
+                    errors.append(f"unsafe or unexpected ZIP path: {member.filename}")
+                    continue
+                name = path.parts[1]
+                if name in members:
+                    errors.append(f"duplicate ZIP entry: {name}")
+                if member.compress_type != zipfile.ZIP_STORED:
+                    errors.append(f"compressed entries are not accepted: {name}")
+                members[name] = member
+            core = {"manifest.json", "SHA256SUMS", "signature.sig", "public_key.pem"}
+            children = {name for name in members if re.fullmatch(r"evidence-\d{3}-.+\.zip", name)}
+            unexpected = set(members) - core - children
+            if core - set(members):
+                errors.append("case bundle is missing integrity files")
+            if unexpected:
+                errors.append(f"unexpected bundle files: {', '.join(sorted(unexpected))}")
+            if not children:
+                errors.append("case bundle contains no evidence packages")
+            if sum(member.file_size for member in members.values()) > 8 * 1024 * 1024 * 1024:
+                errors.append("uncompressed package content exceeds the 8 GiB limit")
+            if errors:
+                return _verification_result(errors, warnings, bundle_id, key_id)
+
+            sums_bytes = archive.read(members["SHA256SUMS"])
+            expected, parse_errors = _parse_sums(sums_bytes)
+            errors.extend(parse_errors)
+            hashed = {"manifest.json", "public_key.pem", *children}
+            if set(expected) != hashed:
+                errors.append("bundle checksum inventory is incomplete or unexpected")
+            for name in sorted(hashed & set(expected)):
+                if _sha256_zip_entry(archive, members[name]) != expected[name]:
+                    errors.append(f"checksum mismatch: {name}")
+
+            embedded_public = archive.read(members["public_key.pem"])
+            trusted_bytes = trusted_public_key.read_bytes() if trusted_public_key else embedded_public
+            if trusted_public_key and trusted_bytes != embedded_public:
+                errors.append("embedded public key does not match the trusted deployment key")
+            key_id = _key_id(trusted_bytes)
+            try:
+                signature = base64.b64decode(
+                    archive.read(members["signature.sig"]).strip(), validate=True)
+                _load_public_key(trusted_bytes).verify(signature, sums_bytes)
+            except (ValueError, InvalidSignature, ForensicExportError):
+                errors.append("Ed25519 signature verification failed")
+            if not trusted_public_key:
+                warnings.append("signer identity was not pinned; integrity is valid against the embedded key")
+
+            try:
+                manifest = json.loads(archive.read(members["manifest.json"]))
+                bundle_id = manifest.get("bundle_id")
+                declared = {item["file"]: item for item in manifest.get("evidence", [])}
+                if set(declared) != children:
+                    errors.append("bundle manifest evidence inventory is incomplete or unexpected")
+                if manifest.get("integrity", {}).get("signing_key_id") != _key_id(embedded_public):
+                    errors.append("manifest signing key ID does not match public_key.pem")
+                for name, item in declared.items():
+                    if item.get("sha256") != expected.get(name):
+                        errors.append(f"manifest artifact hash mismatch: {name}")
+            except (json.JSONDecodeError, AttributeError, KeyError, TypeError):
+                errors.append("manifest.json is invalid")
+
+            # Verify every nested evidence export, not just its parent hash.
+            for name in sorted(children):
+                with tempfile.NamedTemporaryFile(prefix="nested-evidence-", suffix=".zip") as child:
+                    with archive.open(members[name]) as nested:
+                        shutil.copyfileobj(nested, child, length=1024 * 1024)
+                    child.flush()
+                    child_result = _verify_single_export(Path(child.name), trusted_public_key)
+                if not child_result["valid"]:
+                    errors.append(f"nested export failed verification: {name}")
+    except (FileNotFoundError, zipfile.BadZipFile, OSError) as exc:
+        errors.append(f"could not read package: {exc}")
+    return _verification_result(errors, warnings, bundle_id, key_id)
 
 
 def _verification_result(
