@@ -1,0 +1,17 @@
+# BoT-SORT tuned for FIXED CCTV cameras: identical to ultralytics' default botsort.yaml
+# except gmc_method is disabled. Global motion compensation (sparseOptFlow) corrects for
+# CAMERA motion — pointless for a bolted-down CCTV camera, and it runs ORB+optical-flow on
+# CPU every frame, per tracker. Disabling it was measured to remove the live tier's main
+# bottleneck (GPU was starved at ~27% util; the CPU GMC dominated wall time).
+tracker_type: botsort
+track_high_thresh: 0.25
+track_low_thresh: 0.1
+new_track_thresh: 0.25
+track_buffer: 30
+match_thresh: 0.8
+fuse_score: True
+gmc_method: none
+proximity_thresh: 0.5
+appearance_thresh: 0.8
+with_reid: False
+model: auto
