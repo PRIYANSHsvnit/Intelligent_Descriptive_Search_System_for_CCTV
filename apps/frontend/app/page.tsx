@@ -167,6 +167,10 @@ export default function Home() {
   const [board, setBoard] = useState<CaseBoardData | null>(null);
   const [timeline, setTimeline] = useState<AuditEvent[]>([]);
   const [boardMessage, setBoardMessage] = useState<string | null>(null);
+  const [sortMode, setSortMode] = useState<"match" | "earliest" | "latest" | "camera">("match");
+  const [density, setDensity] = useState<"comfortable" | "compact">("comfortable");
+  const [latencyMs, setLatencyMs] = useState<number | null>(null);
+  const queryRef = useRef<HTMLInputElement>(null);
 
   const auto = detectMode(q);
   const effMode: "plate" | "describe" = forceMode ?? auto;
@@ -191,6 +195,7 @@ export default function Home() {
     }
     const em = forceMode ?? detectMode(query);
     setLoading(true); setSearched(true); setContext(null); setError(null);
+    const startedAt = performance.now();
     try {
       const p = new URLSearchParams({ limit: "24" });
       if (em === "plate") p.set("plate", query.trim());
@@ -225,6 +230,7 @@ export default function Home() {
       setSuggestions([]);
       setError(`Search failed (${e instanceof Error ? e.message : "network"}) — is the backend running?`);
     } finally {
+      setLatencyMs(performance.now() - startedAt);
       setLoading(false);
     }
   }, [q, forceMode, scene, cameraId, timeSet, tFrom, tTo, caseId, officer]);
@@ -235,6 +241,7 @@ export default function Home() {
       return;
     }
     setLoading(true); setSearched(true); setContext("matches for the uploaded photo"); setError(null);
+    const startedAt = performance.now();
     try {
       const fd = new FormData();
       fd.append("image", file);
@@ -265,6 +272,7 @@ export default function Home() {
       setSuggestions([]);
       setError(`Image search failed (${e instanceof Error ? e.message : "network"}).`);
     } finally {
+      setLatencyMs(performance.now() - startedAt);
       setLoading(false);
     }
   }, [scene, cameraId, timeSet, tFrom, tTo, caseId, officer]);
@@ -353,14 +361,28 @@ export default function Home() {
     runImageSearch(f);
   }, [runImageSearch]);
 
-  // re-run search whenever a committed FILTER changes (not while typing q); also on mount.
+  // After the first explicit search, re-run whenever a committed filter changes.
   useEffect(() => {
+    if (!searched) return;
     if (mode === "photo" && imgFile) runImageSearch(imgFile);
     else runSearch();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cameraId, timeSet, tFrom, tTo, scene]);
 
   const selectedCam = cameras.find((c) => c.camera_id === cameraId);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const isTyping = target?.tagName === "INPUT" || target?.tagName === "TEXTAREA" || target?.tagName === "SELECT";
+      if (event.key === "/" && !isTyping && mode === "search") {
+        event.preventDefault();
+        queryRef.current?.focus();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [mode]);
 
   const verifyPackage = useCallback(async (file: File | null) => {
     if (!file) return;
@@ -380,6 +402,14 @@ export default function Home() {
     if (timeSet) chips.push({ label: `${tFrom}–${tTo}`, clear: () => setTimeSet(false) });
     return chips;
   }, [selectedCam, timeSet, tFrom, tTo]);
+  const displayedResults = useMemo(() => {
+    const copy = [...results];
+    if (sortMode === "earliest") copy.sort((a, b) => a.ts_start_s - b.ts_start_s);
+    if (sortMode === "latest") copy.sort((a, b) => b.ts_start_s - a.ts_start_s);
+    if (sortMode === "camera") copy.sort((a, b) => (a.camera_label ?? a.camera_id).localeCompare(b.camera_label ?? b.camera_id));
+    return copy;
+  }, [results, sortMode]);
+  const pinnedIds = useMemo(() => new Set(board?.items.filter((item) => item.status === "pinned").map((item) => item.tracklet_id) ?? []), [board]);
 
   return (
     <main className={styles.main}>
@@ -389,17 +419,10 @@ export default function Home() {
           <div className={styles.mark}>
             <svg viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z" /><circle cx="12" cy="12" r="3" /></svg>
           </div>
-          <div>
-            <h1>Descriptive Search</h1>
-            <div className={styles.sub}>Surat City CCTV · Forensic Console</div>
-          </div>
+          <div><h1>Drishti</h1><div className={styles.sub}>Investigation search</div></div>
         </div>
+        <div className={styles.systemState}><span className={styles.liveDot} />System healthy <span>·</span> <b className={styles.mono}>{total.toLocaleString()}</b> entities</div>
         <div className={styles.spacer} />
-        <div className={styles.caseIdentity}>
-          <label>Case<input value={caseId} maxLength={120} onChange={(e) => setCaseId(e.target.value)} /></label>
-          <label>Officer<input value={officer} maxLength={120} placeholder="Badge / name" onChange={(e) => setOfficer(e.target.value)} /></label>
-          <button type="button" onClick={() => setBoardOpen(true)}>Case board <b>{board?.items.filter((i) => i.status === "pinned").length ?? 0}</b></button>
-        </div>
         <label className={styles.verifyBtn}>
           {verifying ? "Verifying…" : "Verify export"}
           <input type="file" accept=".zip,application/zip" hidden disabled={verifying}
@@ -412,28 +435,37 @@ export default function Home() {
           </span>
         )}
         <div className={styles.scenePick}>
-          <span className={styles.dot} />
+          <span className={styles.sceneIcon}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M4 7h16v12H4z"/><path d="m8 7 1-3h6l1 3"/><circle cx="12" cy="13" r="3"/></svg></span>
+          <span className={styles.headerCopy}>Scene</span>
           <select value={scene} onChange={(e) => setScene(e.target.value)}>
             <option value="SUR01">SUR01 · Surat</option>
             <option value="surat-live">surat-live · Surat (live)</option>
             <option value="S01">S01 · CityFlow</option>
           </select>
         </div>
-        <div className={styles.statusChip}>
-          <b className="mono">{total.toLocaleString()}</b> entities · <b className="mono">{cameras.length}</b> cameras
-        </div>
+        <div className={styles.statusChip}><b className={styles.mono}>{cameras.length}</b> cameras</div>
       </div>
 
-      {/* ===== search row ===== */}
+      <div className={styles.workspace}>
+      <section className={styles.intro}>
+        <div><div className={styles.eyebrow}>Search recorded footage</div><h2>What are you looking for?</h2><p>Describe a person or vehicle in plain language, or enter a number plate.</p></div>
+        <div className={styles.kbdHint}>Press <kbd>/</kbd> to focus search</div>
+      </section>
+
       <form
         className={styles.searchrow}
         onSubmit={(e) => { e.preventDefault(); if (mode === "photo") { if (imgFile) runImageSearch(imgFile); } else runSearch(); }}
       >
+        <div className={styles.segmented} role="tablist" aria-label="Search method">
+          <button type="button" role="tab" aria-selected={mode === "search"} className={cx(mode === "search" && styles.on)} onClick={() => setMode("search")}>Describe target</button>
+          <button type="button" role="tab" aria-selected={mode === "photo"} className={cx(mode === "photo" && styles.on)} onClick={() => setMode("photo")}>Search by photo</button>
+        </div>
+        <div className={styles.caseIdentity}>
+          <label><span>Case</span><input value={caseId} maxLength={120} onChange={(e) => setCaseId(e.target.value)} /></label>
+          <label><span>Officer</span><input value={officer} maxLength={120} placeholder="Badge / name" onChange={(e) => setOfficer(e.target.value)} /></label>
+          <button type="button" onClick={() => setBoardOpen(true)} title="Open active case board">Active case <b>{pinnedIds.size}</b></button>
+        </div>
         <div className={styles.searchline}>
-          <div className={styles.segmented}>
-            <button type="button" className={cx(mode === "search" && styles.on)} onClick={() => setMode("search")}>Search</button>
-            <button type="button" className={cx(mode === "photo" && styles.on)} onClick={() => setMode("photo")}>Photo</button>
-          </div>
 
           {mode === "photo" ? (
             <label className={styles.photofield}>
@@ -446,6 +478,7 @@ export default function Home() {
             <div className={styles.searchfield}>
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></svg>
               <input
+                ref={queryRef}
                 value={q}
                 onChange={(e) => { setQ(e.target.value); setForceMode(null); }}
                 placeholder="Describe a person or vehicle — or type a number plate"
@@ -454,15 +487,15 @@ export default function Home() {
             </div>
           )}
 
+          <button className={styles.go} type="submit">{loading ? "Searching…" : "Search footage"}</button>
+        </div>
+
+        <div className={styles.filterRow}>
+          <span className={styles.filterLabel}>Search within</span>
           <LocationCombo cameras={cameras} total={total} value={cameraId} onChange={setCameraId} />
-
-          <TimeSelect
-            cameras={cameras} from={tFrom} to={tTo} set={timeSet}
-            onApply={(f, t) => { setTFrom(f); setTTo(t); setTimeSet(true); }}
-            onClear={() => setTimeSet(false)}
-          />
-
-          <button className={styles.go} type="submit">Search</button>
+          <TimeSelect cameras={cameras} from={tFrom} to={tTo} set={timeSet}
+            onApply={(f, t) => { setTFrom(f); setTTo(t); setTimeSet(true); }} onClear={() => setTimeSet(false)} />
+          {activeChips.length > 0 && <button type="button" className={styles.clearFilters} onClick={() => { setCameraId(""); setTimeSet(false); }}>Clear all</button>}
         </div>
 
         {mode === "search" && (
@@ -496,13 +529,23 @@ export default function Home() {
       {/* ===== results ===== */}
       <div className={styles.content}>
         <div className={styles.resultsHead}>
-          <div className="count" style={{ fontSize: 15, fontWeight: 600 }}>
-            {loading ? "Searching…" : <><b style={{ color: "var(--accent-2)" }} className="mono">{results.length}</b> {results.length === 1 ? "match" : "matches"}</>}
+          <div className={styles.resultCount}>
+            {loading ? "Searching footage…" : <><b className={styles.mono}>{results.length}</b> best {results.length === 1 ? "match" : "matches"}</>}
           </div>
+          {!loading && latencyMs != null && <div className={styles.searchSummary}>searched in {(latencyMs / 1000).toFixed(2)} seconds</div>}
           <div className={styles.activeFilters}>
             {activeChips.map((c) => (
-              <span key={c.label} className={styles.afilter}>{c.label} <button className="x" onClick={c.clear} aria-label={`remove ${c.label}`}>✕</button></span>
+              <span key={c.label} className={styles.afilter}>{c.label} <button onClick={c.clear} aria-label={`remove ${c.label}`}>✕</button></span>
             ))}
+          </div>
+          <label className={styles.sortLabel}>Sort
+            <select value={sortMode} onChange={(event) => setSortMode(event.target.value as typeof sortMode)}>
+              <option value="match">Best match</option><option value="earliest">Earliest first</option><option value="latest">Latest first</option><option value="camera">Camera</option>
+            </select>
+          </label>
+          <div className={styles.density} aria-label="Result density">
+            <button type="button" className={cx(density === "comfortable" && styles.on)} onClick={() => setDensity("comfortable")} title="Comfortable grid">▦</button>
+            <button type="button" className={cx(density === "compact" && styles.on)} onClick={() => setDensity("compact")} title="Compact grid">▦</button>
           </div>
         </div>
 
@@ -530,24 +573,30 @@ export default function Home() {
           </div>
         )}
 
-        <div className={styles.grid}>
-          {results.map((r) => (
-            <article key={r.tracklet_id} className={styles.card}>
+        <div className={cx(styles.grid, density === "compact" && styles.compact)}>
+          {displayedResults.map((r, index) => {
+            const strength = r.matched_on === "exact" ? "Exact match" : (r.component_scores?.find((item) => item.kind === "overall")?.match_strength ?? (index < Math.ceil(displayedResults.length / 3) ? "strong" : "moderate"));
+            const pinned = pinnedIds.has(r.tracklet_id);
+            return (
+            <article key={r.tracklet_id} className={cx(styles.card, pinned && styles.pinned)}>
               <button type="button" className={styles.cardOpen} onClick={() => setActive(r)}>
               <div className={styles.thumbWrap}>
                 {r.crop_url
-                  ? <img className={styles.thumb} src={`${API}${r.crop_url}`} alt={r.subtype} loading="lazy" />
+                  ? <>
+                      <img className={styles.thumbBackdrop} src={`${API}${r.crop_url}`} alt="" aria-hidden="true" loading="lazy" />
+                      <img className={styles.thumb} src={`${API}${r.crop_url}`} alt={`${r.subtype} tracklet preview`} loading="lazy" />
+                    </>
                   : <div className={styles.thumb} />}
                 <div className={styles.scan} />
                 <div className={styles.osd}>{(r.camera_label ?? r.camera_id).toUpperCase().slice(0, 12)} · {fmt(r.ts_start_s)}</div>
-                <div className={styles.score}>{(r.score * 100).toFixed(0)}</div>
+                <div className={cx(styles.strength, (strength === "Exact match" || String(strength).toLowerCase().includes("strong")) && styles.strong)}>{strength === "Exact match" ? strength : `${strength} match`}</div>
               </div>
               <div className={styles.cardBody}>
                 <div className={styles.cardTitle}>
-                  <span className="st" style={{ fontSize: 13, fontWeight: 600, textTransform: "capitalize" }}>{r.subtype}</span>
-                  {r.color && <span className="cl" style={{ fontSize: 11, color: "var(--txt-dim)", textTransform: "capitalize" }}>{r.color}</span>}
+                  <span className={styles.st}>{r.subtype}</span>
+                  {r.color && <span className={styles.cl}>· {r.color}</span>}
                 </div>
-                <div className={styles.cardSub}>{r.camera_label ?? r.camera_id} · <span className="mono">{fmt(r.ts_start_s)}</span></div>
+                <div className={styles.cardSub}>{r.camera_label ?? r.camera_id}<span className={styles.metaDot} /> <span className={styles.mono}>{fmt(r.ts_start_s)}–{fmt(r.ts_end_s)}</span></div>
                 {(r.plate || (r.attrs && r.attrs.length > 0)) && (
                   <div className={styles.tagrow}>
                     {r.plate && <span className={cx(styles.tag, styles.plate)}>{r.plate}</span>}
@@ -559,15 +608,16 @@ export default function Home() {
               </div>
               </button>
               <div className={styles.cardActions}>
-                <button type="button" onClick={() => setCaseItem(r, "pinned")}>＋ Pin</button>
+                <button type="button" className={pinned ? styles.pinnedAction : undefined} onClick={() => setCaseItem(r, "pinned")}>{pinned ? "✓ Pinned" : "＋ Pin to case"}</button>
                 <button type="button" onClick={() => {
                   const reason = window.prompt("Reason for excluding this result (recorded in the audit trail):");
                   if (reason !== null) setCaseItem(r, "excluded", reason);
                 }}>Exclude</button>
               </div>
             </article>
-          ))}
+          );})}
         </div>
+      </div>
       </div>
 
       {active && <Player result={active} search={searchEvidence} caseId={caseId} officer={officer}
@@ -603,7 +653,7 @@ function LocationCombo({ cameras, total, value, onChange }: {
   const opts = useMemo(() => {
     const cov = cameras.length ? `${secToHHMM(Math.min(...cameras.map((c) => c.ts_start_s)))}–${secToHHMM(Math.max(...cameras.map((c) => c.ts_end_s)))}` : "";
     const all = [
-      { camera_id: "", camera_label: "All locations", count: total, cov, whole: true },
+      { camera_id: "", camera_label: "All cameras", count: total, cov, whole: true },
       ...cameras.map((c) => ({ camera_id: c.camera_id, camera_label: c.camera_label, count: c.count, cov: `${secToHHMM(c.ts_start_s)}–${secToHHMM(c.ts_end_s)}`, whole: false })),
     ];
     const q = typing ? text.trim().toLowerCase() : "";
@@ -621,11 +671,11 @@ function LocationCombo({ cameras, total, value, onChange }: {
 
   return (
     <div className={cx(styles.combo, open && styles.open)} ref={ref}>
-      <span className={styles.fieldLbl}>Location</span>
+      <span className={styles.fieldLbl}>Camera</span>
       <div className={styles.comboField} onClick={() => { if (!open) { setOpen(true); setHi(-1); } inputRef.current?.focus(); }}>
         <svg className={styles.pin} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z" /><circle cx="12" cy="10" r="3" /></svg>
         <input
-          ref={inputRef} value={text} placeholder="All locations" autoComplete="off" spellCheck={false}
+          ref={inputRef} value={text} placeholder="All cameras" autoComplete="off" spellCheck={false}
           onChange={(e) => { setText(e.target.value); setTyping(true); setHi(-1); setOpen(true); }}
           onKeyDown={(e) => {
             if (e.key === "ArrowDown") { e.preventDefault(); setHi((h) => Math.min(h + 1, opts.length - 1)); }
