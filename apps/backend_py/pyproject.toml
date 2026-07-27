@@ -23,6 +23,8 @@ dependencies = [
     "python-dotenv>=1.0",
     # Ed25519 signatures for portable, tamper-evident forensic export packages.
     "cryptography>=45.0",
+    "fpdf2>=2.8",
+    "uharfbuzz>=0.39",
 ]
 
 [tool.uv]

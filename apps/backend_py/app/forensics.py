@@ -21,11 +21,10 @@ import re
 import shutil
 import subprocess
 import tempfile
-import textwrap
 import uuid
 import zipfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -37,9 +36,10 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
 )
-from PIL import Image, ImageDraw, ImageFont
+from fpdf import FPDF
+from PIL import Image, ImageDraw
 
-from . import boxes, config
+from . import boxes, config, i18n
 
 PACKAGE_ROOT = "case-export"
 BUNDLE_ROOT = "case-bundle"
@@ -279,59 +279,192 @@ def _create_annotated_frame(
     }
 
 
-def _wrap_lines(lines: list[str], width: int = 92) -> list[str]:
-    out: list[str] = []
-    for line in lines:
-        out.extend(textwrap.wrap(str(line), width=width) or [""])
-    return out
+FONT_DIR = Path(__file__).resolve().parent / "fonts"
+# Pillow on this deployment is built without libraqm, so it cannot shape Devanagari or
+# Gujarati at all (no matra reordering, no conjunct formation). fpdf2 + uharfbuzz does
+# real HarfBuzz shaping and embeds subset fonts, so the report is selectable text too.
+_SCRIPT_FONTS = {
+    "latin": ("NotoSans-Regular.ttf", "NotoSans-Bold.ttf"),
+    "devanagari": ("NotoSansDevanagari-Regular.ttf", "NotoSansDevanagari-Bold.ttf"),
+    "gujarati": ("NotoSansGujarati-Regular.ttf", "NotoSansGujarati-Bold.ttf"),
+}
+_INK = (28, 34, 44)
+_HEADING = (18, 55, 105)
+_BAND = (18, 28, 44)
+_MUTED = (98, 108, 124)
+
+
+def _wall_clock(scene: str, ts_s: float) -> str:
+    """Scene-clock seconds -> 'YYYY-MM-DD HH:MM:SS.mmm'.
+
+    Time-of-day is the real camera clock recorded at ingest; the date comes from
+    `config.recording_date`. Seconds past 24h roll the date forward correctly.
+    """
+    date_iso, _ = config.recording_date(scene)
+    try:
+        base = datetime.strptime(date_iso, "%Y-%m-%d")
+    except ValueError:
+        base = datetime.strptime(config.INGEST_BASE_DATE, "%Y-%m-%d")
+    stamp = base + timedelta(seconds=float(ts_s))
+    return f"{stamp:%Y-%m-%d %H:%M:%S}.{stamp.microsecond // 1000:03d}"
+
+
+class _ReportPDF(FPDF):
+    """A4 report whose footer stays in the language of the page it sits on."""
+
+    def __init__(self) -> None:
+        super().__init__(orientation="P", unit="mm", format="A4")
+        self.case_id = ""
+        self.lang = "en"
+        # A section's first page is pinned here; continuation pages produced by an
+        # auto page break are not, and fall back to the section language in self.lang.
+        self.page_lang: dict[int, str] = {}
+        self.set_auto_page_break(auto=True, margin=18)
+        self.set_margins(18, 18, 18)
+        for family, (regular, bold) in _SCRIPT_FONTS.items():
+            self.add_font(family, "", FONT_DIR / regular)
+            self.add_font(family, "B", FONT_DIR / bold)
+        # Every face must fall back to every other one: Indic Noto faces lack some Latin
+        # punctuation (Gujarati has no em dash), and the English page has to render an
+        # operator query that may itself be typed in Gujarati or Hindi. Without this,
+        # HarfBuzz drops the unsupported runs silently.
+        self.set_fallback_fonts(list(_SCRIPT_FONTS), exact_match=False)
+        self.set_text_shaping(True)
+
+    def footer(self) -> None:
+        lang = self.page_lang.get(self.page_no(), self.lang)
+        self.set_y(-14)
+        self.set_font(i18n.LANGUAGE_SCRIPT[lang], "", 7.5)
+        self.set_text_color(*_MUTED)
+        self.cell(0, 6, f"{self.case_id}  ·  {i18n.LANGUAGE_NAMES[lang]}", align="L")
+        self.cell(0, 6, f"{i18n.t('page_of', lang)} {self.page_no()}", align="R")
+
+
+def _report_rows(summary: dict[str, Any], lang: str) -> list[tuple[str, str, str]]:
+    """(kind, label, value) rows. Facts stay verbatim; only labels are translated."""
+    rows: list[tuple[str, str, str]] = [
+        ("kv", i18n.t("case_id", lang), summary["case_id"]),
+        ("kv", i18n.t("export_id", lang), summary["export_id"]),
+        ("kv", i18n.t("officer", lang), summary["officer"]),
+        ("kv", i18n.t("report_generated", lang), summary["created_at"]),
+        ("head", i18n.t("section_search", lang), ""),
+        ("kv", i18n.t("query", lang), summary["query"] or i18n.t("query_absent", lang)),
+        ("kv", i18n.t("filters", lang),
+         json.dumps(summary["filters"], ensure_ascii=False, sort_keys=True)),
+        ("kv", i18n.t("retrieval_method", lang), summary["retrieval_method"]),
+    ]
+    if summary.get("searched_at"):
+        rows.append(("kv", i18n.t("searched_at", lang), summary["searched_at"]))
+    rows += [
+        ("head", i18n.t("section_evidence", lang), ""),
+        ("kv", i18n.t("tracklet", lang), summary["tracklet_id"]),
+        ("kv", i18n.t("camera", lang), f"{summary['camera_label']} ({summary['camera_id']})"),
+        ("kv", i18n.t("scene", lang), summary["scene"]),
+        ("kv", i18n.t("sighting_start", lang), summary["wall_start"]),
+        ("kv", i18n.t("sighting_end", lang), summary["wall_end"]),
+        ("kv", i18n.t("duration", lang),
+         f"{summary['ts_end_s'] - summary['ts_start_s']:.3f} {i18n.t('seconds_short', lang)}"),
+        ("kv", i18n.t("video_offset", lang),
+         (f"{summary['video_start_s']:.3f} – {summary['video_end_s']:.3f} "
+          f"{i18n.t('seconds_short', lang)}")),
+        ("note", i18n.t("clock_note", lang).format(tz=config.RECORDING_TIMEZONE), ""),
+        ("kv", i18n.t("entity", lang), i18n.entity_phrase(
+            summary.get("color"), summary["subtype"], summary["entity_type"], lang)),
+    ]
+    if summary.get("plate"):
+        rows.append(("kv", i18n.t("plate", lang), summary["plate"]))
+    rows += [
+        ("kv", i18n.t("source_sha256", lang), summary["source_sha256"]),
+        ("head", i18n.t("section_integrity", lang), ""),
+        ("body", i18n.t("integrity_source", lang), ""),
+        ("body", i18n.t("integrity_derived", lang), ""),
+        ("body", i18n.t("integrity_verify", lang), ""),
+        ("kv", i18n.t("signing_key", lang), summary["signing_key_id"]),
+    ]
+    return rows
+
+
+def _render_language_page(pdf: _ReportPDF, summary: dict[str, Any], lang: str) -> None:
+    family = i18n.LANGUAGE_SCRIPT[lang]
+    # add_page() flushes the previous page's footer, so pdf.lang may only advance after it.
+    pdf.add_page()
+    pdf.lang = lang
+    pdf.page_lang[pdf.page_no()] = lang
+
+    pdf.set_fill_color(*_BAND)
+    pdf.rect(0, 0, 210, 34, style="F")
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font(family, "B", 15)
+    pdf.set_xy(18, 8)
+    pdf.cell(174, 8, i18n.t("report_title", lang))
+    pdf.set_font(family, "", 9)
+    pdf.set_text_color(170, 200, 245)
+    pdf.set_xy(18, 18)
+    pdf.cell(174, 5, i18n.t("report_subtitle", lang))
+    pdf.set_xy(18, 24)
+    pdf.cell(174, 5, i18n.LANGUAGE_NAMES[lang])
+
+    pdf.set_xy(18, 41)
+    pdf.set_text_color(*_MUTED)
+    pdf.set_font(family, "", 7.8)
+    pdf.multi_cell(174, 4, i18n.t("translation_note", lang), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(3)
+
+    label_w, value_w, line_h = 48.0, 126.0, 5.2
+    for kind, left, right in _report_rows(summary, lang):
+        if kind == "head":
+            pdf.ln(2.5)
+            pdf.set_font(family, "B", 11)
+            pdf.set_text_color(*_HEADING)
+            pdf.cell(0, 6.5, left, new_x="LMARGIN", new_y="NEXT")
+            y = pdf.get_y()
+            pdf.set_draw_color(*_HEADING)
+            pdf.set_line_width(0.3)
+            pdf.line(18, y, 192, y)
+            pdf.ln(2)
+            continue
+        if kind in ("body", "note"):
+            if kind == "note":
+                pdf.ln(1.5)
+            pdf.set_font(family, "", 8.2 if kind == "note" else 8.8)
+            pdf.set_text_color(*(_MUTED if kind == "note" else _INK))
+            pdf.multi_cell(174, line_h, left, new_x="LMARGIN", new_y="NEXT")
+            continue
+
+        # Two-column key/value: measure both sides first, so a wrapped value (a 64-char
+        # hash, a long query) cannot desynchronise the next row's baseline.
+        pdf.set_font(family, "B", 8.8)
+        label_lines = pdf.multi_cell(label_w, line_h, left, dry_run=True, output="LINES")
+        pdf.set_font(family, "", 8.8)
+        value_lines = pdf.multi_cell(value_w, line_h, right, dry_run=True, output="LINES")
+        height = line_h * max(len(label_lines), len(value_lines), 1)
+        if pdf.get_y() + height > pdf.page_break_trigger:
+            pdf.add_page()
+        top = pdf.get_y()
+        pdf.set_font(family, "B", 8.8)
+        pdf.set_text_color(*_HEADING)
+        pdf.set_xy(18, top)
+        pdf.multi_cell(label_w, line_h, left, new_x="RIGHT", new_y="TOP")
+        pdf.set_font(family, "", 8.8)
+        pdf.set_text_color(*_INK)
+        pdf.set_xy(18 + label_w, top)
+        pdf.multi_cell(value_w, line_h, right, new_x="LMARGIN", new_y="TOP")
+        pdf.set_xy(18, top + height)
 
 
 def _create_report(path: Path, summary: dict[str, Any]) -> None:
-    """Create a dependency-light, valid PDF report using Pillow's PDF encoder."""
-    page = Image.new("RGB", (1240, 1754), "white")
-    draw = ImageDraw.Draw(page)
-    title_font = ImageFont.load_default(size=28)
-    body_font = ImageFont.load_default(size=18)
-    small_font = ImageFont.load_default(size=15)
-    draw.rectangle((0, 0, 1240, 125), fill=(18, 28, 44))
-    draw.text((65, 38), "CCTV FORENSIC EXPORT REPORT", fill="white", font=title_font)
-    draw.text((65, 85), "Tamper-evident evidence package", fill=(170, 200, 245),
-              font=small_font)
-    lines = _wrap_lines([
-        f"Case ID: {summary['case_id']}",
-        f"Export ID: {summary['export_id']}",
-        f"Officer / user: {summary['officer']}",
-        f"Created (UTC): {summary['created_at']}",
-        "",
-        "SEARCH",
-        f"Query: {summary['query'] or '[not supplied]'}",
-        f"Filters: {json.dumps(summary['filters'], ensure_ascii=False, sort_keys=True)}",
-        f"Retrieval: {summary['retrieval_method']}",
-        "",
-        "EVIDENCE",
-        f"Tracklet: {summary['tracklet_id']}",
-        f"Camera: {summary['camera_label']} ({summary['camera_id']})",
-        f"Scene: {summary['scene']}",
-        f"Source timestamps: {summary['ts_start_s']:.3f}s - {summary['ts_end_s']:.3f}s",
-        f"Entity: {summary['color'] or ''} {summary['subtype']} ({summary['entity_type']})".strip(),
-        f"Source SHA-256: {summary['source_sha256']}",
-        "",
-        "INTEGRITY",
-        "The original_or_source_clip.mp4 file is an unannotated byte-for-byte copy.",
-        "selected_clip.mp4 and annotated_frame.jpg are derived review artifacts.",
-        "Run the verifier against this ZIP. A valid Ed25519 signature and matching",
-        "SHA-256 digests are required before the package is reported as VALID.",
-        f"Signing key: {summary['signing_key_id']}",
-    ])
-    y = 165
-    for line in lines:
-        font = body_font if line in {"SEARCH", "EVIDENCE", "INTEGRITY"} else small_font
-        color = (18, 55, 105) if line in {"SEARCH", "EVIDENCE", "INTEGRITY"} else (28, 34, 44)
-        draw.text((65, y), line, fill=color, font=font)
-        y += 31 if font == body_font else 25
-        if y > 1670:
-            break
-    page.save(path, "PDF", resolution=150.0)
+    """Trilingual (English / Hindi / Gujarati) PDF report, one page per language.
+
+    English is rendered first as the authoritative text; every language section carries
+    the identical set of recorded facts.
+    """
+    pdf = _ReportPDF()
+    pdf.case_id = str(summary["case_id"])
+    pdf.set_title(f"CCTV forensic export report - {summary['case_id']}")
+    pdf.set_lang("en")
+    for lang in i18n.LANGUAGES:
+        _render_language_page(pdf, summary, lang)
+    pdf.output(str(path))
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -390,6 +523,7 @@ def create_export(request: dict[str, Any]) -> ExportResult:
 
         search = request.get("search") or {}
         retrieval = request.get("retrieval") or {}
+        recording_date, date_configured = config.recording_date(evidence["scene"])
         summary = {
             "case_id": case_id,
             "export_id": export_id,
@@ -398,15 +532,21 @@ def create_export(request: dict[str, Any]) -> ExportResult:
             "query": str(search.get("original_query", ""))[:1000],
             "filters": search.get("filters") if isinstance(search.get("filters"), dict) else {},
             "retrieval_method": str(retrieval.get("method", "unspecified"))[:120],
+            "searched_at": search.get("timestamp_utc"),
             "tracklet_id": evidence["tracklet_id"],
             "camera_label": config.camera_label(evidence["scene"], evidence["camera_id"]),
             "camera_id": evidence["camera_id"],
             "scene": evidence["scene"],
             "ts_start_s": float(evidence["ts_start_s"]),
             "ts_end_s": float(evidence["ts_end_s"]),
+            "wall_start": _wall_clock(evidence["scene"], evidence["ts_start_s"]),
+            "wall_end": _wall_clock(evidence["scene"], evidence["ts_end_s"]),
+            "video_start_s": video_start,
+            "video_end_s": video_end,
             "entity_type": evidence["entity_type"],
             "subtype": evidence["subtype"],
             "color": evidence.get("color"),
+            "plate": evidence.get("plate_text"),
             "source_sha256": source_sha,
             "signing_key_id": signing_key_id,
         }
@@ -452,6 +592,17 @@ def create_export(request: dict[str, Any]) -> ExportResult:
                 "location": summary["camera_label"],
                 "source_timestamp_start_s": summary["ts_start_s"],
                 "source_timestamp_end_s": summary["ts_end_s"],
+                "sighting_start_wall_clock": summary["wall_start"],
+                "sighting_end_wall_clock": summary["wall_end"],
+                "wall_clock": {
+                    "timezone": config.RECORDING_TIMEZONE,
+                    "recording_date": recording_date,
+                    "recording_date_source": (
+                        "deployment configuration (RECORDING_DATES)" if date_configured
+                        else "ingest base date placeholder; not read from source metadata"
+                    ),
+                    "time_of_day_source": "camera scene clock recorded at ingest",
+                },
                 "video_local_timestamp_start_s": round(video_start, 3),
                 "video_local_timestamp_end_s": round(video_end, 3),
                 "selected_clip_start_s": round(clip_start, 3),
@@ -467,6 +618,15 @@ def create_export(request: dict[str, Any]) -> ExportResult:
                 "plate": evidence.get("plate_text"),
                 "global_id": evidence.get("global_id"),
                 "annotated_frame": frame_meta,
+            },
+            "report": {
+                "file": "report.pdf",
+                "languages": list(i18n.LANGUAGES),
+                "authoritative_language": "en",
+                "translation_scope": (
+                    "fixed labels and detector vocabulary only; identifiers, hashes, "
+                    "filters, timestamps and the operator query are verbatim in every language"
+                ),
             },
             "models": config.forensic_model_inventory(evidence["scene"]),
             "retrieval": {

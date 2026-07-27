@@ -13,7 +13,7 @@ case-export/
 ├── selected_clip.mp4            derived, padded review clip
 ├── annotated_frame.jpg          derived full frame with tracklet box
 ├── manifest.json                provenance and artifact roles
-├── report.pdf                   human-readable case summary
+├── report.pdf                   human-readable case summary (English / हिन्दी / ગુજરાતી)
 ├── SHA256SUMS                   hashes every file above plus public_key.pem
 ├── signature.sig                Ed25519 signature over exact SHA256SUMS bytes
 └── public_key.pem               portable verification material
@@ -26,6 +26,52 @@ export does not overclaim that a transcoded ingest artifact is the camera-origin
 
 The manifest cannot contain its own hash. Instead, `SHA256SUMS` hashes `manifest.json` and
 all other artifacts. `signature.sig` signs `SHA256SUMS`, avoiding a circular self-hash.
+
+## Trilingual report
+
+`report.pdf` carries the same case summary three times — one page per language, English
+first as the authoritative text, then हिन्दी and ગુજરાતી. Two rules keep the translated
+report defensible:
+
+- **Only fixed text is translated.** Section headings, field labels, and the standing
+  integrity statements come from a static catalogue in `apps/backend_py/app/i18n.py`. No
+  machine translation runs during an export, so identical input always produces identical
+  report bytes.
+- **Recorded facts are verbatim in every language.** Case and export IDs, hashes, filters,
+  camera IDs, timestamps, and the officer's original query are reproduced unchanged.
+  Translating a query would misstate what was actually searched — a Gujarati query stays
+  Gujarati on the English page.
+
+Detector vocabulary (`entity_type`, `subtype`, `color`) is the single exception: it is a
+closed set emitted by our own models, so it renders as `સફેદ એસયુવી (વાહન) · white suv
+(vehicle)` — readable locally while keeping the machine-emitted token auditable. A model
+class with no entry in the catalogue falls back to the raw English token rather than
+disappearing.
+
+Rendering uses `fpdf2` + `uharfbuzz` with Noto fonts vendored under
+`apps/backend_py/app/fonts/` (OFL, see `OFL.txt` there). HarfBuzz shaping is required —
+Pillow is built without `libraqm` on this deployment and cannot reorder matras or form
+conjuncts at all. Each script's face falls back to the other two, because the Indic Noto
+faces lack some Latin punctuation (Gujarati has no em dash) and any page may need to render
+a query typed in another script.
+
+## Timestamps
+
+The report prints full wall-clock date and time for the start and end of the sighting
+(`2025-11-14 06:14:10.050`), alongside the position within the source file.
+
+The time-of-day is the real camera scene clock recorded at ingest. **The date is a
+deployment setting, not metadata read from the source file** — ingest stores tracklet times
+against the placeholder constant `SCENE_BASE_WALL` (`2024-01-01`). Set the true date per
+scene so exports are not stamped with the placeholder:
+
+```env
+RECORDING_DATES=SUR01=2025-11-14,surat-live=2025-11-14
+RECORDING_TIMEZONE=IST (UTC+05:30)
+```
+
+Both the report page and `manifest.json → evidence.wall_clock` state which of the two
+applied, so a reviewer can always tell a configured recording date from the placeholder.
 
 ## Apply the additive schema migration
 
@@ -102,6 +148,8 @@ The signed manifest records:
 - case ID, export ID, officer/user, and UTC creation time;
 - original and rewritten query, search timestamp, and explicit filters;
 - scene, camera/location, scene-clock and video-local timestamps;
+- wall-clock sighting start/end plus the provenance of the date and timezone used;
+- report languages, the authoritative language, and what translation covered;
 - tracklet ID, every stored crop ID, and selected crop;
 - entity metadata and the annotated-frame bounding box;
 - detector, tracker, semantic model, model revision configuration, and VLM state;

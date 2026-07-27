@@ -108,6 +108,27 @@ def _scene_offsets(scene: str) -> dict[str, float]:
 def camera_offset(scene: str, camera_id: str) -> float:
     return _scene_offsets(scene).get(camera_id, 0.0)
 
+# Wall-clock rendering for forensic reports. Stored tracklet timestamps are scene-clock
+# seconds whose time-of-day is the real camera clock, but whose date component comes from
+# the ingest constant SCENE_BASE_WALL (2024-01-01) — a placeholder, not footage metadata.
+# The report therefore prints a configured recording date and says so explicitly rather
+# than presenting the ingest placeholder as a recorded fact.
+RECORDING_TIMEZONE = os.environ.get("RECORDING_TIMEZONE", "IST (UTC+05:30)")
+# ISO date (YYYY-MM-DD) per scene: "SUR01=2025-11-14,S01=2024-01-01". Scenes absent here
+# fall back to the ingest base date, which keeps existing exports reproducible.
+_RECORDING_DATES = dict(
+    part.split("=", 1)
+    for part in os.environ.get("RECORDING_DATES", "").split(",")
+    if "=" in part
+)
+INGEST_BASE_DATE = os.environ.get("INGEST_BASE_DATE", "2024-01-01")
+
+
+def recording_date(scene: str) -> tuple[str, bool]:
+    """(ISO date for `scene`, whether it was explicitly configured)."""
+    configured = _RECORDING_DATES.get(scene)
+    return (configured, True) if configured else (INGEST_BASE_DATE, False)
+
 # SigLIP text encoder device: CPU is plenty for one short query per search.
 DEVICE = os.environ.get("SEARCH_DEVICE", "cpu")
 
