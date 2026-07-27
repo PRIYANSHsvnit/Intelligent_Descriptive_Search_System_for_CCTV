@@ -73,3 +73,5 @@ apps/ingest/*.log
 # Generated forensic evidence and local signing keys (never commit either).
 apps/backend_py/forensic_exports/
 apps/backend_py/.forensic_keys/
+
+*.tex
