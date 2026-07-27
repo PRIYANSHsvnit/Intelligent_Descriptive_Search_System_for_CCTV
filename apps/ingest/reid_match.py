@@ -30,6 +30,14 @@ def main() -> int:
     ap.add_argument("--plates-only", action="store_true",
                     help="stitch by plate_text must-links only; no appearance edges; "
                          "write gids only for multi-tracklet groups")
+    ap.add_argument("--fragment", action="store_true",
+                    help="also stitch same-camera fragments of one subject (gated by "
+                         "matcher L1/L2/L3 — see pipeline/matcher.py)")
+    ap.add_argument("--entity", default=None, choices=("person", "vehicle"),
+                    help="restrict matching to one entity type")
+    ap.add_argument("--vec-file", default="reid_appearance.npy",
+                    help="appearance vectors under vec/ (e.g. semantic.npy while no "
+                         "person re-ID encoder exists)")
     args = ap.parse_args()
     cams = args.cams or paths.list_cams(args.scene)
 
@@ -53,7 +61,8 @@ def main() -> int:
 
     threshold = 2.0 if args.plates_only else args.threshold  # cosine <= 1: no appearance edges
     res = matcher.run(args.scene, cams, threshold=threshold, w=args.w,
-                      only_groups=args.plates_only)
+                      fragment=args.fragment, only_groups=args.plates_only,
+                      vec_file=args.vec_file, entity=args.entity)
     print("matcher:", res)
     gid_map = {k: int(v) for k, v in
                __import__("json").loads((paths.OUTPUT_ROOT / args.scene / "global_ids.json").read_text()).items()}
